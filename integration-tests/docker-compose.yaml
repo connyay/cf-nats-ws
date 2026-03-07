@@ -1,0 +1,21 @@
+services:
+  nats:
+    image: nats:2.11-alpine
+    command: -c /etc/nats/nats.conf
+    environment:
+      - TOKEN=${NATS_TOKEN:-dev-nats-token}
+    ports:
+      - "4222:4222" # Client connections (TCP)
+      - "8443:8443" # WebSocket connections
+      - "8222:8222" # HTTP monitoring
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - jetstream_data:/data
+    healthcheck:
+      test: ["CMD", "nats-server", "--help"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  jetstream_data:
