@@ -1,0 +1,31 @@
+[package]
+name = "cf-nats-ws"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A WASM-compatible NATS client for Cloudflare Workers using WebSocket transport"
+repository = "https://github.com/connyay/cf-nats-ws"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = "0.7"
+futures = "0.3"
+futures-channel = "0.3"
+futures-util = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Crypto", "WorkerGlobalScope"] }
+js-sys = "0.3"
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+debug = []
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
