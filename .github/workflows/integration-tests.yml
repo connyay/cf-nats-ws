@@ -1,0 +1,53 @@
+name: Integration Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start NATS
+        run: |
+          docker run -d \
+            --name test-nats \
+            -e TOKEN=dev-nats-token \
+            -p 4222:4222 \
+            -p 8443:8443 \
+            -p 8222:8222 \
+            -v ${{ github.workspace }}/integration-tests/nats.conf:/etc/nats/nats.conf:ro \
+            nats:2.11-alpine \
+            -c /etc/nats/nats.conf
+          # Wait for NATS to be ready
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8222/healthz > /dev/null 2>&1; then
+              echo "NATS is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install integration test dependencies
+        working-directory: integration-tests
+        run: npm ci
+
+      - name: Run integration tests
+        working-directory: integration-tests
+        run: npm test
