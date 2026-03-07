@@ -1,5 +1,5 @@
-/target
-/build
+target/
+build/
 *.wasm
 wasm-pack-out/
 node_modules/
