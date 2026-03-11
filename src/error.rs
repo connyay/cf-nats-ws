@@ -17,6 +17,9 @@ pub enum NatsError {
     #[error("Timeout")]
     Timeout,
 
+    #[error("No responders available for request")]
+    NoResponders,
+
     #[error("Server error: {0}")]
     Server(String),
 
@@ -37,6 +40,31 @@ pub enum NatsError {
 }
 
 pub type Result<T> = std::result::Result<T, NatsError>;
+
+/// Returns true if the server error message indicates a connection-terminating error
+/// per the NATS protocol specification.
+pub fn is_fatal_server_error(msg: &str) -> bool {
+    let normalized = msg
+        .trim()
+        .trim_start_matches('\'')
+        .trim_end_matches('\'')
+        .to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "unknown protocol operation"
+            | "attempted to connect to route port"
+            | "authorization violation"
+            | "authorization timeout"
+            | "invalid client protocol"
+            | "maximum control line exceeded"
+            | "parser error"
+            | "secure connection - tls required"
+            | "stale connection"
+            | "maximum connections exceeded"
+            | "slow consumer"
+            | "maximum payload violation"
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +127,12 @@ mod tests {
     }
 
     #[test]
+    fn test_no_responders_display() {
+        let err = NatsError::NoResponders;
+        assert_eq!(err.to_string(), "No responders available for request");
+    }
+
+    #[test]
     fn test_result_type_ok() {
         let result: Result<i32> = Ok(42);
         assert_eq!(result.unwrap(), 42);
@@ -115,5 +149,46 @@ mod tests {
         let err = NatsError::WebSocket("test".to_string());
         let debug = format!("{:?}", err);
         assert!(debug.contains("WebSocket"));
+    }
+
+    #[test]
+    fn test_is_fatal_server_error() {
+        // Fatal errors (connection-terminating)
+        assert!(is_fatal_server_error("'Authorization Violation'"));
+        assert!(is_fatal_server_error("'Stale Connection'"));
+        assert!(is_fatal_server_error("'Maximum Payload Violation'"));
+        assert!(is_fatal_server_error("'Unknown Protocol Operation'"));
+        assert!(is_fatal_server_error("'Slow Consumer'"));
+        assert!(is_fatal_server_error("'Maximum Connections Exceeded'"));
+        assert!(is_fatal_server_error("'Parser Error'"));
+        assert!(is_fatal_server_error("'Secure Connection - TLS Required'"));
+        assert!(is_fatal_server_error("'Authorization Timeout'"));
+        assert!(is_fatal_server_error("'Invalid Client Protocol'"));
+        assert!(is_fatal_server_error("'Maximum Control Line Exceeded'"));
+        assert!(is_fatal_server_error(
+            "'Attempted To Connect To Route Port'"
+        ));
+
+        // Non-fatal errors
+        assert!(!is_fatal_server_error("'Invalid Subject'"));
+        assert!(!is_fatal_server_error(
+            "'Permissions Violation for Subscription to foo.bar'"
+        ));
+        assert!(!is_fatal_server_error(
+            "'Permissions Violation for Publish to foo.bar'"
+        ));
+    }
+
+    #[test]
+    fn test_is_fatal_server_error_case_insensitive() {
+        assert!(is_fatal_server_error("'authorization violation'"));
+        assert!(is_fatal_server_error("'STALE CONNECTION'"));
+        assert!(is_fatal_server_error("'Maximum Payload Violation'"));
+    }
+
+    #[test]
+    fn test_is_fatal_server_error_whitespace() {
+        assert!(is_fatal_server_error("  'Stale Connection'  "));
+        assert!(is_fatal_server_error("'Stale Connection'"));
     }
 }

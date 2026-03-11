@@ -12,7 +12,7 @@ use worker::{console_error, console_log, console_warn};
 
 pub struct NatsClient {
     transport: Rc<WsTransport>,
-    server_info: ServerInfo,
+    server_info: Rc<RefCell<ServerInfo>>,
     subscriptions: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     next_sid: Rc<RefCell<u64>>,
     pongs: Rc<RefCell<VecDeque<oneshot::Sender<()>>>>,
@@ -110,10 +110,11 @@ impl NatsClient {
         let subscriptions = Rc::new(RefCell::new(HashMap::new()));
         let next_sid = Rc::new(RefCell::new(1));
         let pongs = Rc::new(RefCell::new(VecDeque::new()));
+        let server_info = Rc::new(RefCell::new(server_info));
 
         let client = Self {
             transport: transport.clone(),
-            server_info,
+            server_info: server_info.clone(),
             subscriptions: subscriptions.clone(),
             next_sid,
             pongs: pongs.clone(),
@@ -123,9 +124,12 @@ impl NatsClient {
         let transport_clone = transport.clone();
         let subs_clone = subscriptions.clone();
         let pongs_clone = pongs.clone();
+        let info_clone = server_info.clone();
         worker::wasm_bindgen_futures::spawn_local(async move {
             debug_log!("NatsClient: Starting message processor");
-            if let Err(e) = Self::process_messages(transport_clone, subs_clone, pongs_clone).await {
+            if let Err(e) =
+                Self::process_messages(transport_clone, subs_clone, pongs_clone, info_clone).await
+            {
                 console_log!("NatsClient: Message processing error: {:?}", e);
             }
         });
@@ -137,6 +141,7 @@ impl NatsClient {
         transport: Rc<WsTransport>,
         subscriptions: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
         pongs: Rc<RefCell<VecDeque<oneshot::Sender<()>>>>,
+        server_info: Rc<RefCell<ServerInfo>>,
     ) -> Result<()> {
         let mut parser = Parser::new();
         debug_log!("NatsClient: Message processor started");
@@ -178,10 +183,27 @@ impl NatsClient {
                             debug_log!("NatsClient: Got OK");
                         }
                         Op::Err(e) => {
-                            console_error!("NatsClient: Server error: {}", e);
+                            if crate::error::is_fatal_server_error(&e) {
+                                console_error!(
+                                    "NatsClient: Fatal server error, closing connection: {}",
+                                    e
+                                );
+                                let _ = transport.close();
+                                return Err(NatsError::Server(e));
+                            }
+                            console_warn!("NatsClient: Server error: {}", e);
                         }
-                        Op::Info(_json) => {
-                            debug_log!("NatsClient: Got additional INFO: {}", _json);
+                        Op::Info(json) => {
+                            debug_log!("NatsClient: Got async INFO update: {}", json);
+                            match serde_json::from_str::<ServerInfo>(&json) {
+                                Ok(new_info) => {
+                                    *server_info.borrow_mut() = new_info;
+                                    debug_log!("NatsClient: Server info updated");
+                                }
+                                Err(e) => {
+                                    console_warn!("NatsClient: Failed to parse async INFO: {}", e);
+                                }
+                            }
                         }
                     }
                 }
@@ -193,14 +215,27 @@ impl NatsClient {
         Ok(())
     }
 
+    fn check_payload_size(&self, size: usize) -> Result<()> {
+        let max_payload = self.server_info.borrow().max_payload;
+        if max_payload > 0 && size as i64 > max_payload {
+            return Err(NatsError::Protocol(format!(
+                "payload size {} exceeds server max_payload {}",
+                size, max_payload
+            )));
+        }
+        Ok(())
+    }
+
     pub fn publish(&self, subject: &str, data: &[u8]) -> Result<()> {
         debug_log!("NatsClient: Publishing to {}", subject);
+        self.check_payload_size(data.len())?;
         let cmd = protocol::build_pub_cmd(subject, None, data)?;
         self.transport.send(&cmd)
     }
 
     pub fn publish_with_reply(&self, subject: &str, reply: &str, data: &[u8]) -> Result<()> {
         debug_log!("NatsClient: Publishing to {} with reply {}", subject, reply);
+        self.check_payload_size(data.len())?;
         let cmd = protocol::build_pub_cmd(subject, Some(reply), data)?;
         self.transport.send(&cmd)
     }
@@ -213,6 +248,7 @@ impl NatsClient {
     ) -> Result<()> {
         debug_log!("NatsClient: Publishing to {} with headers", subject);
         let encoded_headers = headers.encode();
+        self.check_payload_size(encoded_headers.len() + data.len())?;
         let cmd = protocol::build_hpub_cmd(subject, None, &encoded_headers, data)?;
         self.transport.send(&cmd)
     }
@@ -230,6 +266,7 @@ impl NatsClient {
             reply
         );
         let encoded_headers = headers.encode();
+        self.check_payload_size(encoded_headers.len() + data.len())?;
         let cmd = protocol::build_hpub_cmd(subject, Some(reply), &encoded_headers, data)?;
         self.transport.send(&cmd)
     }
@@ -344,6 +381,14 @@ impl NatsClient {
                         worker::js_sys::global()
                             .unchecked_into::<web_sys::WorkerGlobalScope>()
                             .clear_timeout_with_handle(timeout_id);
+
+                        // Check for No Responders (503 status)
+                        if let Some(headers) = &msg.headers
+                            && headers.status_code() == Some(503)
+                        {
+                            return Err(NatsError::NoResponders);
+                        }
+
                         Ok(msg)
                     }
                     None => {
@@ -424,8 +469,8 @@ impl NatsClient {
         }
     }
 
-    pub fn server_info(&self) -> &ServerInfo {
-        &self.server_info
+    pub fn server_info(&self) -> ServerInfo {
+        self.server_info.borrow().clone()
     }
 
     pub fn close(&self) -> Result<()> {

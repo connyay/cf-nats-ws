@@ -129,23 +129,26 @@ impl KvStore {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
 
+                // Extract creation timestamp from headers
+                let created = msg
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get("Nats-Time-Stamp"))
+                    .map(|ts| {
+                        let ms = js_sys::Date::parse(ts);
+                        if ms.is_nan() { 0 } else { ms as u64 }
+                    })
+                    .unwrap_or(0);
+
                 Ok(Some(KvEntry {
                     key: key.to_string(),
                     value: msg.data,
                     revision: seq,
-                    created: 0, // Would need to parse from headers
+                    created,
                     operation: Operation::Put,
                 }))
             }
-            Err(e) => {
-                // Check if it's a 404 (key not found)
-                if e.to_string().contains("404") || e.to_string().contains("No Message Found") {
-                    debug_log!("KV: Key {} not found", key);
-                    Ok(None)
-                } else {
-                    Err(e)
-                }
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -262,6 +265,7 @@ impl KvStore {
         let prefix = format!("{}.{}.", KV_PREFIX, self.bucket);
         let mut keys = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut received = 0u64;
 
         while let Some(msg) = sub.next().await {
             // Skip flow control / heartbeat messages (status 100)
@@ -273,6 +277,8 @@ impl KvStore {
                 }
                 continue;
             }
+
+            received += 1;
 
             // Skip deleted/purged keys
             let is_deleted = msg
@@ -288,7 +294,12 @@ impl KvStore {
                 keys.push(key.to_string());
             }
 
-            // Check pending count from reply subject to know when we're done
+            // Break when we've received all expected messages
+            if received >= num_pending {
+                break;
+            }
+
+            // Also check pending count from reply subject as a fallback
             if let Some(reply) = &msg.reply
                 && parse_pending_from_reply(reply) == Some(0)
             {

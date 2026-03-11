@@ -25,6 +25,11 @@ fn validate_name(value: &str, kind: &str) -> Result<()> {
             "{kind} cannot contain CR or LF"
         )));
     }
+    if value.contains('\t') {
+        return Err(NatsError::InvalidSubject(format!(
+            "{kind} cannot contain tabs"
+        )));
+    }
     if value.contains('\0') {
         return Err(NatsError::InvalidSubject(format!(
             "{kind} cannot contain null bytes"
@@ -39,6 +44,41 @@ pub fn validate_subject(subject: &str) -> Result<()> {
 
 pub fn validate_queue_group(queue: &str) -> Result<()> {
     validate_name(queue, "queue group")
+}
+
+pub fn validate_subscribe_subject(subject: &str) -> Result<()> {
+    validate_name(subject, "subject")?;
+
+    if subject.contains("..") {
+        return Err(NatsError::InvalidSubject(
+            "subject cannot contain empty tokens".to_string(),
+        ));
+    }
+
+    let tokens: Vec<&str> = subject.split('.').collect();
+    let last_idx = tokens.len() - 1;
+
+    for (i, token) in tokens.iter().enumerate() {
+        if token.contains('*') && *token != "*" {
+            return Err(NatsError::InvalidSubject(
+                "wildcard '*' must be a separate token".to_string(),
+            ));
+        }
+        if token.contains('>') {
+            if *token != ">" {
+                return Err(NatsError::InvalidSubject(
+                    "wildcard '>' must be a separate token".to_string(),
+                ));
+            }
+            if i != last_idx {
+                return Err(NatsError::InvalidSubject(
+                    "wildcard '>' must be the last token".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn build_connect_cmd(connect_info: &crate::types::ConnectInfo) -> Result<Vec<u8>> {
@@ -110,7 +150,7 @@ pub fn build_hpub_cmd(
 }
 
 pub fn build_sub_cmd(subject: &str, queue: Option<&str>, sid: u64) -> Result<Vec<u8>> {
-    validate_subject(subject)?;
+    validate_subscribe_subject(subject)?;
     if let Some(queue) = queue {
         validate_queue_group(queue)?;
     }
@@ -305,6 +345,11 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_subject_rejects_tabs() {
+        assert!(validate_subject("foo\tbar").is_err());
+    }
+
+    #[test]
     fn test_validate_subject_rejects_cr_lf() {
         assert!(validate_subject("foo\r\nbar").is_err());
         assert!(validate_subject("foo\rbar").is_err());
@@ -493,6 +538,59 @@ mod tests {
         assert_eq!(OP_PING, "PING");
         assert_eq!(OP_PONG, "PONG");
         assert_eq!(OP_INFO, "INFO");
+    }
+
+    #[test]
+    fn test_validate_subscribe_subject_valid() {
+        assert!(validate_subscribe_subject("foo.bar").is_ok());
+        assert!(validate_subscribe_subject("foo.*").is_ok());
+        assert!(validate_subscribe_subject("foo.>").is_ok());
+        assert!(validate_subscribe_subject(">").is_ok());
+        assert!(validate_subscribe_subject("*").is_ok());
+        assert!(validate_subscribe_subject("foo.*.bar").is_ok());
+        assert!(validate_subscribe_subject("foo.*.bar.>").is_ok());
+    }
+
+    #[test]
+    fn test_validate_subscribe_subject_rejects_empty_tokens() {
+        assert!(validate_subscribe_subject("foo..bar").is_err());
+        assert!(validate_subscribe_subject("..").is_err());
+        assert!(validate_subscribe_subject("foo..").is_err());
+    }
+
+    #[test]
+    fn test_validate_subscribe_subject_rejects_partial_wildcard() {
+        assert!(validate_subscribe_subject("foo*.bar").is_err());
+        assert!(validate_subscribe_subject("foo.ba*").is_err());
+        assert!(validate_subscribe_subject("foo.*r").is_err());
+    }
+
+    #[test]
+    fn test_validate_subscribe_subject_rejects_gt_not_last() {
+        assert!(validate_subscribe_subject("foo.>.bar").is_err());
+        assert!(validate_subscribe_subject(">.foo").is_err());
+    }
+
+    #[test]
+    fn test_validate_subscribe_subject_rejects_partial_gt() {
+        assert!(validate_subscribe_subject("foo.bar>").is_err());
+        assert!(validate_subscribe_subject("foo.>bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_subscribe_subject_inherits_base_validation() {
+        assert!(validate_subscribe_subject("").is_err());
+        assert!(validate_subscribe_subject("foo bar").is_err());
+        assert!(validate_subscribe_subject("foo\tbar").is_err());
+        assert!(validate_subscribe_subject("foo\r\n").is_err());
+        assert!(validate_subscribe_subject("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn test_build_sub_cmd_rejects_invalid_wildcard_subjects() {
+        assert!(build_sub_cmd("foo*.bar", None, 1).is_err());
+        assert!(build_sub_cmd("foo.>.bar", None, 1).is_err());
+        assert!(build_sub_cmd("foo..bar", None, 1).is_err());
     }
 
     #[test]
