@@ -1,0 +1,22 @@
+{
+  "name": "cf-nats-ws-integration-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:worker": "cd test-worker && cargo install -q worker-build@^0.7 && worker-build --release",
+    "pretest": "npm run build:worker",
+    "test": "NODE_OPTIONS='--experimental-vm-modules' vitest run",
+    "test:watch": "NODE_OPTIONS='--experimental-vm-modules' vitest",
+    "test:no-build": "NODE_OPTIONS='--experimental-vm-modules' vitest run",
+    "test:no-build:watch": "NODE_OPTIONS='--experimental-vm-modules' vitest",
+    "docker:up": "docker compose up -d --wait",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "miniflare": "^4.0.0",
+    "nats": "^2.28.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
