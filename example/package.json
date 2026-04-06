@@ -1,0 +1,11 @@
+{
+  "name": "example-cf-nats-ws",
+  "private": true,
+  "main": "lib.rs",
+  "scripts": {
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "wrangler": "^4.69.0"
+  }
+}
