@@ -1,0 +1,7 @@
+/target
+/build
+*.wasm
+wasm-pack-out/
+node_modules/
+.wrangler/
+package-lock.json
