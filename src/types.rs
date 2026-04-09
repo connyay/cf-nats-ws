@@ -18,6 +18,17 @@ pub struct ServerInfo {
     pub cluster: Option<String>,
     pub proto: u8,
     pub headers: Option<bool>,
+    #[serde(default)]
+    pub connect_urls: Option<Vec<String>>,
+    #[serde(default)]
+    pub ws_connect_urls: Option<Vec<String>>,
+    pub ldm: Option<bool>,
+    pub jetstream: Option<bool>,
+    pub git_commit: Option<String>,
+    pub ip: Option<String>,
+    pub domain: Option<String>,
+    pub tls_verify: Option<bool>,
+    pub tls_available: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +308,16 @@ mod tests {
             "nonce": "abc123",
             "cluster": "my-cluster",
             "proto": 1,
-            "headers": true
+            "headers": true,
+            "connect_urls": ["nats://host1:4222", "nats://host2:4222"],
+            "ws_connect_urls": ["wss://host1:443"],
+            "ldm": false,
+            "jetstream": true,
+            "git_commit": "abc123def",
+            "ip": "192.168.1.1",
+            "domain": "my-domain",
+            "tls_verify": false,
+            "tls_available": true
         }"#;
         let info: ServerInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.server_name, Some("my-server".to_string()));
@@ -309,5 +329,45 @@ mod tests {
         assert_eq!(info.nonce, Some("abc123".to_string()));
         assert_eq!(info.cluster, Some("my-cluster".to_string()));
         assert_eq!(info.headers, Some(true));
+        assert_eq!(
+            info.connect_urls,
+            Some(vec![
+                "nats://host1:4222".to_string(),
+                "nats://host2:4222".to_string()
+            ])
+        );
+        assert_eq!(
+            info.ws_connect_urls,
+            Some(vec!["wss://host1:443".to_string()])
+        );
+        assert_eq!(info.ldm, Some(false));
+        assert_eq!(info.jetstream, Some(true));
+        assert_eq!(info.git_commit, Some("abc123def".to_string()));
+        assert_eq!(info.ip, Some("192.168.1.1".to_string()));
+        assert_eq!(info.domain, Some("my-domain".to_string()));
+        assert_eq!(info.tls_verify, Some(false));
+        assert_eq!(info.tls_available, Some(true));
+    }
+
+    #[test]
+    fn test_server_info_missing_new_fields_uses_defaults() {
+        let json = r#"{
+            "server_id": "test",
+            "version": "2.10.0",
+            "host": "0.0.0.0",
+            "port": 4222,
+            "max_payload": 1048576,
+            "proto": 1
+        }"#;
+        let info: ServerInfo = serde_json::from_str(json).unwrap();
+        assert!(info.connect_urls.is_none());
+        assert!(info.ws_connect_urls.is_none());
+        assert!(info.ldm.is_none());
+        assert!(info.jetstream.is_none());
+        assert!(info.git_commit.is_none());
+        assert!(info.ip.is_none());
+        assert!(info.domain.is_none());
+        assert!(info.tls_verify.is_none());
+        assert!(info.tls_available.is_none());
     }
 }

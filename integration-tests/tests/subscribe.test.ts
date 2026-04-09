@@ -141,9 +141,7 @@ describe("subscribe", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
 
-    // Should have received at most max_msgs
-    expect(body.messages.length).toBeLessThanOrEqual(maxMsgs);
-    expect(body.messages.length).toBeGreaterThan(0);
+    expect(body.messages.length).toBe(maxMsgs);
   });
 
   it("worker receives reply subject on published messages", async () => {

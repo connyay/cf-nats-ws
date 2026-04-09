@@ -267,6 +267,9 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "max_payload": info.max_payload,
                 "proto": info.proto,
                 "headers": info.headers,
+                "jetstream": info.jetstream,
+                "connect_urls": info.connect_urls,
+                "domain": info.domain,
             }))
         })
         .post_async("/flush", |_, ctx| async move {

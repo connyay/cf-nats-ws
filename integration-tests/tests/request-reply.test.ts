@@ -47,18 +47,13 @@ describe("request/reply", () => {
 
     const res = await workerFetch("request", {
       method: "POST",
-      body: { subject, data: "hello", timeout_ms: 1000 },
+      body: { subject, data: "hello", timeout_ms: 2000 },
     });
 
-    // NATS with no_responders sends back a 503 status message immediately,
-    // or the request times out. Either way the worker should indicate failure.
-    if (res.status >= 400) {
-      // Worker returned an error status (timeout or explicit error)
-      expect(res.status).toBeGreaterThanOrEqual(400);
-    } else {
-      // Worker returned 200 with the no_responders message in the body
-      const body = await res.json();
-      expect(body.reply).toBe("");
-    }
+    // With no_responders enabled, the server sends a 503 status HMSG
+    // which the client converts to a NoResponders error
+    expect(res.status).toBe(504);
+    const body = await res.text();
+    expect(body.toLowerCase()).toContain("no responders");
   });
 });

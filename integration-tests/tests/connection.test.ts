@@ -14,6 +14,7 @@ describe("connection", () => {
     expect(info.max_payload).toBeGreaterThan(0);
     expect(info.proto).toBeGreaterThanOrEqual(1);
     expect(info.headers).toBe(true);
+    expect(info.jetstream).toBe(true);
   });
 
   it("flush completes successfully", async () => {

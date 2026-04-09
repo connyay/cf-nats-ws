@@ -309,6 +309,82 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_msg_case_insensitive() {
+        let mut parser = Parser::new();
+        let input = b"msg test.subject 1 5\r\nhello\r\n";
+        let ops = parser.parse(input).unwrap();
+        assert_eq!(ops.len(), 1);
+        if let Op::Msg(msg, sid) = &ops[0] {
+            assert_eq!(msg.subject, "test.subject");
+            assert_eq!(*sid, 1);
+            assert_eq!(msg.data, b"hello");
+        } else {
+            panic!("Expected Op::Msg");
+        }
+    }
+
+    #[test]
+    fn test_parse_hmsg_case_insensitive() {
+        let mut parser = Parser::new();
+        let headers = b"NATS/1.0\r\n\r\n";
+        let payload = b"data";
+        let total_size = headers.len() + payload.len();
+        let input = format!("hmsg test.subject 1 {} {}\r\n", headers.len(), total_size);
+        let mut full_input = input.into_bytes();
+        full_input.extend_from_slice(headers);
+        full_input.extend_from_slice(payload);
+        full_input.extend_from_slice(b"\r\n");
+
+        let ops = parser.parse(&full_input).unwrap();
+        assert_eq!(ops.len(), 1);
+        if let Op::HMsg(msg, sid) = &ops[0] {
+            assert_eq!(msg.subject, "test.subject");
+            assert_eq!(*sid, 1);
+            assert_eq!(msg.data, b"data");
+        } else {
+            panic!("Expected Op::HMsg");
+        }
+    }
+
+    #[test]
+    fn test_parse_hmsg_malformed_headers() {
+        let mut parser = Parser::new();
+        // Malformed headers (not valid NATS/1.0 format)
+        let headers = b"GARBAGE\r\n\r\n";
+        let payload = b"data";
+        let total_size = headers.len() + payload.len();
+        let input = format!("HMSG test.subject 1 {} {}\r\n", headers.len(), total_size);
+        let mut full_input = input.into_bytes();
+        full_input.extend_from_slice(headers);
+        full_input.extend_from_slice(payload);
+        full_input.extend_from_slice(b"\r\n");
+
+        // Should still parse successfully (headers fall back to default)
+        let ops = parser.parse(&full_input).unwrap();
+        assert_eq!(ops.len(), 1);
+        if let Op::HMsg(msg, _) = &ops[0] {
+            assert_eq!(msg.data, b"data");
+            // Headers should be default (empty) since decode falls back
+            let headers = msg.headers.as_ref().unwrap();
+            assert!(headers.is_empty());
+        } else {
+            panic!("Expected Op::HMsg");
+        }
+    }
+
+    #[test]
+    fn test_parse_err_without_message() {
+        let mut parser = Parser::new();
+        let ops = parser.parse(b"-ERR \r\n").unwrap();
+        assert_eq!(ops.len(), 1);
+        if let Op::Err(msg) = &ops[0] {
+            assert_eq!(msg, "");
+        } else {
+            panic!("Expected Op::Err");
+        }
+    }
+
+    #[test]
     fn test_parse_large_msg() {
         let mut parser = Parser::new();
         let payload = "x".repeat(10000);

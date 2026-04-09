@@ -56,8 +56,7 @@ describe("kv advanced", () => {
     expect(body.value).toBe("hello");
     expect(body.key).toBe("meta-test");
     expect(body.revision).toBeGreaterThan(0);
-    // created is not yet populated by the library (always 0)
-    expect(body.created).toBeDefined();
+    expect(body.created).toBeGreaterThan(0);
 
     // Cleanup
     await jsm.streams.delete(`KV_${bucket}`);
@@ -161,13 +160,10 @@ describe("kv advanced", () => {
       expect(res.status).toBe(200);
     }
 
-    // kv.keys() uses push consumers which may not work in all environments
-    const res = await Promise.race([
-      workerFetch("kv/keys", { method: "POST", body: { bucket } }),
-      new Promise<Response>((_, reject) =>
-        setTimeout(() => reject(new Error("kv/keys timed out")), 10000),
-      ),
-    ]);
+    const res = await workerFetch("kv/keys", {
+      method: "POST",
+      body: { bucket },
+    });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.keys.sort()).toEqual(["alpha", "beta", "gamma"]);
@@ -191,12 +187,10 @@ describe("kv advanced", () => {
       body: { bucket, key: "remove" },
     });
 
-    const res = await Promise.race([
-      workerFetch("kv/keys", { method: "POST", body: { bucket } }),
-      new Promise<Response>((_, reject) =>
-        setTimeout(() => reject(new Error("kv/keys timed out")), 10000),
-      ),
-    ]);
+    const res = await workerFetch("kv/keys", {
+      method: "POST",
+      body: { bucket },
+    });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.keys).toEqual(["keep"]);
