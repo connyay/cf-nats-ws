@@ -1,6 +1,6 @@
 [package]
 name = "cf-nats-ws"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "A WASM-compatible NATS client for Cloudflare Workers using WebSocket transport"
