@@ -27,7 +27,7 @@ cf-nats-ws = "0.1"
 ```rust
 use cf_nats_ws::NatsClient;
 
-let client = NatsClient::connect("wss://demo.nats.io:443").await?;
+let client = NatsClient::connect("wss://demo.nats.io:8443").await?;
 ```
 
 ### Publishing
