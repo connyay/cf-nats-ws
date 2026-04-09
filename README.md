@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cf-nats-ws = { git = "https://github.com/connyay/cf-nats-ws" }
+cf-nats-ws = "0.1"
 ```
 
 ## Usage
