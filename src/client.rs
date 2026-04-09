@@ -84,21 +84,7 @@ impl NatsClient {
         debug_log!("NatsClient: Got server info: {:?}", server_info.server_id);
 
         // Send CONNECT
-        let connect_info = ConnectInfo {
-            name: options.name,
-            verbose: options.verbose,
-            pedantic: options.pedantic,
-            echo: options.echo,
-            headers: options.headers,
-            auth_token: options.auth_token,
-            user: options.user,
-            pass: options.pass,
-            jwt: options.jwt,
-            nkey: options.nkey,
-            ..Default::default()
-        };
-
-        let connect_cmd = protocol::build_connect_cmd(&connect_info)?;
+        let connect_cmd = protocol::build_connect_cmd(&ConnectInfo::from(options))?;
         debug_log!("NatsClient: Sending CONNECT command");
         transport.send(&connect_cmd)?;
 
@@ -227,17 +213,11 @@ impl NatsClient {
     }
 
     pub fn publish(&self, subject: &str, data: &[u8]) -> Result<()> {
-        debug_log!("NatsClient: Publishing to {}", subject);
-        self.check_payload_size(data.len())?;
-        let cmd = protocol::build_pub_cmd(subject, None, data)?;
-        self.transport.send(&cmd)
+        self.publish_inner(subject, None, None, data)
     }
 
     pub fn publish_with_reply(&self, subject: &str, reply: &str, data: &[u8]) -> Result<()> {
-        debug_log!("NatsClient: Publishing to {} with reply {}", subject, reply);
-        self.check_payload_size(data.len())?;
-        let cmd = protocol::build_pub_cmd(subject, Some(reply), data)?;
-        self.transport.send(&cmd)
+        self.publish_inner(subject, Some(reply), None, data)
     }
 
     pub fn publish_with_headers(
@@ -246,11 +226,7 @@ impl NatsClient {
         headers: &crate::headers::Headers,
         data: &[u8],
     ) -> Result<()> {
-        debug_log!("NatsClient: Publishing to {} with headers", subject);
-        let encoded_headers = headers.encode();
-        self.check_payload_size(encoded_headers.len() + data.len())?;
-        let cmd = protocol::build_hpub_cmd(subject, None, &encoded_headers, data)?;
-        self.transport.send(&cmd)
+        self.publish_inner(subject, None, Some(headers), data)
     }
 
     pub fn publish_with_headers_and_reply(
@@ -260,14 +236,25 @@ impl NatsClient {
         headers: &crate::headers::Headers,
         data: &[u8],
     ) -> Result<()> {
-        debug_log!(
-            "NatsClient: Publishing to {} with headers and reply {}",
-            subject,
-            reply
-        );
-        let encoded_headers = headers.encode();
-        self.check_payload_size(encoded_headers.len() + data.len())?;
-        let cmd = protocol::build_hpub_cmd(subject, Some(reply), &encoded_headers, data)?;
+        self.publish_inner(subject, Some(reply), Some(headers), data)
+    }
+
+    fn publish_inner(
+        &self,
+        subject: &str,
+        reply: Option<&str>,
+        headers: Option<&crate::headers::Headers>,
+        data: &[u8],
+    ) -> Result<()> {
+        debug_log!("NatsClient: Publishing to {}", subject);
+        let cmd = if let Some(headers) = headers {
+            let encoded = headers.encode();
+            self.check_payload_size(encoded.len() + data.len())?;
+            protocol::build_hpub_cmd(subject, reply, &encoded, data)?
+        } else {
+            self.check_payload_size(data.len())?;
+            protocol::build_pub_cmd(subject, reply, data)?
+        };
         self.transport.send(&cmd)
     }
 
@@ -329,144 +316,39 @@ impl NatsClient {
     ) -> Result<Message> {
         debug_log!("NatsClient: Making request to {}", subject);
         let inbox = format!("_INBOX.{}", generate_inbox_id());
-        debug_log!("NatsClient: Using inbox {}", inbox);
 
         let mut sub = self.subscribe(&inbox).await?;
         self.publish_with_reply(subject, &inbox, data)?;
 
-        debug_log!(
-            "NatsClient: Waiting for response with {}ms timeout...",
-            timeout_ms
-        );
+        let msg = wasm_timeout(timeout_ms as i32, Box::pin(sub.next()))
+            .await?
+            .ok_or(NatsError::Timeout)?;
 
-        // Create a timeout using WASM-compatible approach
-        use wasm_bindgen::JsCast;
-        use wasm_bindgen::prelude::*;
-
-        let (timeout_tx, timeout_rx) = futures::channel::oneshot::channel::<()>();
-        let timeout_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(timeout_tx)));
-
-        let closure = Closure::once(move || {
-            if let Some(tx) = timeout_tx.borrow_mut().take() {
-                let _ = tx.send(());
-            }
-        });
-
-        let timeout_id = worker::js_sys::global()
-            .unchecked_into::<web_sys::WorkerGlobalScope>()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                closure.as_ref().unchecked_ref(),
-                timeout_ms as i32,
-            )
-            .map_err(|_| NatsError::InvalidState("Failed to set timeout".to_string()))?;
-        // Closure::once is consumed when the timeout fires, so it cleans up automatically.
-        // However, if the message arrives first and the timeout never fires, the closure is
-        // never called and JS still holds a reference — forget() is required in WASM to prevent
-        // the closure from being invalidated while JS holds that reference.
-        closure.forget();
-
-        // Race between message and timeout using futures::future::select
-        use futures::future::{Either, select};
-
-        let msg_future = Box::pin(sub.next());
-        let select_result = select(msg_future, timeout_rx).await;
-
-        match select_result {
-            Either::Left((msg, _)) => {
-                // Message arrived first
-                match msg {
-                    Some(msg) => {
-                        debug_log!("NatsClient: Got response");
-                        // Clean up timeout
-                        worker::js_sys::global()
-                            .unchecked_into::<web_sys::WorkerGlobalScope>()
-                            .clear_timeout_with_handle(timeout_id);
-
-                        // Check for No Responders (503 status)
-                        if let Some(headers) = &msg.headers
-                            && headers.status_code() == Some(503)
-                        {
-                            return Err(NatsError::NoResponders);
-                        }
-
-                        Ok(msg)
-                    }
-                    None => {
-                        debug_log!("NatsClient: No response (channel closed)");
-                        Err(NatsError::Timeout)
-                    }
-                }
-            }
-            Either::Right(_) => {
-                // Timeout fired first
-                debug_log!("NatsClient: Request timed out");
-                Err(NatsError::Timeout)
-            }
+        // Check for No Responders (503 status)
+        if let Some(headers) = &msg.headers
+            && headers.status_code() == Some(503)
+        {
+            return Err(NatsError::NoResponders);
         }
+
+        Ok(msg)
     }
 
     pub async fn flush(&self) -> Result<()> {
         debug_log!("NatsClient: Flushing - sending PING and waiting for PONG");
 
-        let flush_timeout_ms: i32 = 5000;
-
-        // Create a oneshot channel for this flush
         let (tx, rx) = oneshot::channel();
-
-        // Add to pongs queue
         {
-            let mut pongs = self.pongs.borrow_mut();
-            pongs.push_back(tx);
+            self.pongs.borrow_mut().push_back(tx);
         }
-
-        // Send PING
         self.transport.send(protocol::PING)?;
 
-        // Create a timeout using WASM-compatible approach
-        use wasm_bindgen::JsCast;
-        use wasm_bindgen::prelude::*;
+        wasm_timeout(5000, rx)
+            .await?
+            .map_err(|_| NatsError::InvalidState("Flush cancelled".to_string()))?;
 
-        let (timeout_tx, timeout_rx) = futures::channel::oneshot::channel::<()>();
-        let timeout_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(timeout_tx)));
-
-        let closure = Closure::once(move || {
-            if let Some(tx) = timeout_tx.borrow_mut().take() {
-                let _ = tx.send(());
-            }
-        });
-
-        let timeout_id = worker::js_sys::global()
-            .unchecked_into::<web_sys::WorkerGlobalScope>()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                closure.as_ref().unchecked_ref(),
-                flush_timeout_ms,
-            )
-            .map_err(|_| NatsError::InvalidState("Failed to set timeout".to_string()))?;
-        // See comment in request_with_timeout for why forget() is necessary in WASM.
-        closure.forget();
-
-        // Race between PONG and timeout
-        use futures::future::{Either, select};
-
-        let pong_future = Box::pin(rx);
-        let select_result = select(pong_future, timeout_rx).await;
-
-        match select_result {
-            Either::Left((pong_result, _)) => {
-                // PONG arrived first — clean up timeout
-                worker::js_sys::global()
-                    .unchecked_into::<web_sys::WorkerGlobalScope>()
-                    .clear_timeout_with_handle(timeout_id);
-                pong_result.map_err(|_| NatsError::InvalidState("Flush cancelled".to_string()))?;
-                debug_log!("NatsClient: Flush complete - PONG received");
-                Ok(())
-            }
-            Either::Right(_) => {
-                // Timeout fired first
-                debug_log!("NatsClient: Flush timed out waiting for PONG");
-                Err(NatsError::Timeout)
-            }
-        }
+        debug_log!("NatsClient: Flush complete - PONG received");
+        Ok(())
     }
 
     pub fn server_info(&self) -> ServerInfo {
@@ -573,7 +455,6 @@ pub(crate) fn generate_inbox_id() -> String {
     use wasm_bindgen::JsCast;
 
     let buf = js_sys::Uint8Array::new_with_length(16);
-    // Use crypto.getRandomValues for CSPRNG
     let crypto =
         js_sys::Reflect::get(&js_sys::global(), &"crypto".into()).expect("crypto not available");
     let crypto: web_sys::Crypto = crypto.unchecked_into();
@@ -581,6 +462,52 @@ pub(crate) fn generate_inbox_id() -> String {
         .get_random_values_with_array_buffer_view(&buf)
         .expect("getRandomValues failed");
 
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let bytes: Vec<u8> = buf.to_vec();
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Race a future against a WASM setTimeout. Returns Err(Timeout) if the timer fires first.
+async fn wasm_timeout<F: std::future::Future + Unpin>(
+    timeout_ms: i32,
+    future: F,
+) -> Result<F::Output> {
+    use futures::future::{Either, select};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::prelude::*;
+
+    let (timeout_tx, timeout_rx) = futures::channel::oneshot::channel::<()>();
+    let timeout_tx = Rc::new(RefCell::new(Some(timeout_tx)));
+
+    let closure = Closure::once(move || {
+        if let Some(tx) = timeout_tx.borrow_mut().take() {
+            let _ = tx.send(());
+        }
+    });
+
+    let timeout_id = worker::js_sys::global()
+        .unchecked_into::<web_sys::WorkerGlobalScope>()
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            timeout_ms,
+        )
+        .map_err(|_| NatsError::InvalidState("Failed to set timeout".to_string()))?;
+    // Closure::once is consumed when the timeout fires, but if the future resolves first,
+    // JS still holds a reference — forget() prevents invalidation in WASM.
+    closure.forget();
+
+    match select(std::pin::pin!(future), timeout_rx).await {
+        Either::Left((result, _)) => {
+            worker::js_sys::global()
+                .unchecked_into::<web_sys::WorkerGlobalScope>()
+                .clear_timeout_with_handle(timeout_id);
+            Ok(result)
+        }
+        Either::Right(_) => Err(NatsError::Timeout),
+    }
 }

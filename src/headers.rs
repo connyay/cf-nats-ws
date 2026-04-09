@@ -83,25 +83,22 @@ impl Headers {
 
     /// Encode headers to NATS wire format
     pub fn encode(&self) -> Vec<u8> {
-        let mut result = Vec::new();
+        use std::io::Write;
+        let mut result = Vec::with_capacity(128);
 
-        // Start with version line
+        result.extend_from_slice(HEADER_VERSION.as_bytes());
         if let (Some(code), Some(desc)) = (self.status_code, &self.status_description) {
-            result.extend_from_slice(format!("{HEADER_VERSION} {code} {desc}\r\n").as_bytes());
-        } else {
-            result.extend_from_slice(format!("{HEADER_VERSION}\r\n").as_bytes());
+            let _ = write!(result, " {code} {desc}");
         }
+        result.extend_from_slice(b"\r\n");
 
-        // Add headers
         for (key, values) in &self.inner {
             for value in values {
-                result.extend_from_slice(format!("{key}: {value}\r\n").as_bytes());
+                let _ = write!(result, "{key}: {value}\r\n");
             }
         }
 
-        // End with empty line
         result.extend_from_slice(b"\r\n");
-
         result
     }
 
@@ -156,22 +153,22 @@ impl Headers {
     }
 }
 
-/// Canonicalize header key to Title-Case
+/// Canonicalize header key to Title-Case in a single pass.
 fn canonicalize_header_key(key: String) -> String {
-    key.split('-')
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => {
-                    let first = first.to_ascii_uppercase();
-                    let rest = chars.map(|c| c.to_ascii_lowercase()).collect::<String>();
-                    format!("{first}{rest}")
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("-")
+    let mut result = String::with_capacity(key.len());
+    let mut capitalize_next = true;
+    for c in key.chars() {
+        if c == '-' {
+            result.push('-');
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c.to_ascii_lowercase());
+        }
+    }
+    result
 }
 
 #[cfg(test)]

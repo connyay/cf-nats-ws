@@ -47,7 +47,7 @@ impl JetStreamClient {
     ) -> Result<PubAck> {
         debug_log!("JetStream: Publishing to {}", subject);
 
-        let inbox = format!("_INBOX.{}", generate_inbox());
+        let inbox = format!("_INBOX.{}", crate::client::generate_inbox_id());
         let mut sub = self.client.subscribe(&inbox).await?;
 
         if let Some(headers) = headers {
@@ -71,19 +71,7 @@ impl JetStreamClient {
     pub async fn stream_info(&self, stream: &str) -> Result<StreamInfo> {
         let subject = format!("{}.STREAM.INFO.{}", self.prefix, stream);
         let response = self.api_request(&subject, b"").await?;
-
-        let info: ApiResponse<StreamInfo> = serde_json::from_slice(&response.data)
-            .map_err(|e| NatsError::Parse(format!("Failed to parse stream info: {e}")))?;
-
-        if let Some(error) = info.error {
-            return Err(NatsError::Server(format!(
-                "{}: {}",
-                error.code, error.description
-            )));
-        }
-
-        info.response
-            .ok_or_else(|| NatsError::Parse("No stream info in response".to_string()))
+        parse_api_response(&response.data)
     }
 
     /// Create a stream
@@ -91,41 +79,16 @@ impl JetStreamClient {
         let subject = format!("{}.STREAM.CREATE.{}", self.prefix, config.name);
         let data = serde_json::to_vec(config)
             .map_err(|e| NatsError::Parse(format!("Failed to serialize stream config: {e}")))?;
-
         let response = self.api_request(&subject, &data).await?;
-
-        let info: ApiResponse<StreamInfo> =
-            serde_json::from_slice(&response.data).map_err(|e| {
-                NatsError::Parse(format!("Failed to parse stream create response: {e}"))
-            })?;
-
-        if let Some(error) = info.error {
-            return Err(NatsError::Server(format!(
-                "{}: {}",
-                error.code, error.description
-            )));
-        }
-
-        info.response
-            .ok_or_else(|| NatsError::Parse("No stream info in response".to_string()))
+        parse_api_response(&response.data)
     }
 
     /// Delete a stream
     pub async fn delete_stream(&self, stream: &str) -> Result<bool> {
         let subject = format!("{}.STREAM.DELETE.{}", self.prefix, stream);
         let response = self.api_request(&subject, b"").await?;
-
-        let result: ApiResponse<DeleteResponse> = serde_json::from_slice(&response.data)
-            .map_err(|e| NatsError::Parse(format!("Failed to parse delete response: {e}")))?;
-
-        if let Some(error) = result.error {
-            return Err(NatsError::Server(format!(
-                "{}: {}",
-                error.code, error.description
-            )));
-        }
-
-        Ok(result.response.map(|r| r.success).unwrap_or(false))
+        let result: DeleteResponse = parse_api_response(&response.data)?;
+        Ok(result.success)
     }
 
     /// Create or get a KV store
@@ -140,8 +103,17 @@ impl JetStreamClient {
     }
 }
 
-fn generate_inbox() -> String {
-    crate::client::generate_inbox_id()
+fn parse_api_response<T: for<'a> Deserialize<'a>>(data: &[u8]) -> Result<T> {
+    let resp: ApiResponse<T> = serde_json::from_slice(data)
+        .map_err(|e| NatsError::Parse(format!("Failed to parse API response: {e}")))?;
+    if let Some(error) = resp.error {
+        return Err(NatsError::Server(format!(
+            "{}: {}",
+            error.code, error.description
+        )));
+    }
+    resp.response
+        .ok_or_else(|| NatsError::Parse("Empty API response".to_string()))
 }
 
 // JetStream types
@@ -241,6 +213,92 @@ struct ApiError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeleteResponse {
     success: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::NatsError;
+
+    #[test]
+    fn test_parse_api_response_success() {
+        let data = br#"{"success": true}"#;
+        let result: DeleteResponse = parse_api_response(data).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_parse_api_response_success_complex_type() {
+        let data = br#"{
+            "config": {"name": "test", "subjects": ["foo.>"]},
+            "created": "2024-01-01T00:00:00Z",
+            "state": {"messages": 10, "bytes": 1024, "first_seq": 1, "last_seq": 10, "consumer_count": 2}
+        }"#;
+        let info: StreamInfo = parse_api_response(data).unwrap();
+        assert_eq!(info.config.name, "test");
+        assert_eq!(info.state.messages, 10);
+        assert_eq!(info.state.last_seq, 10);
+    }
+
+    #[test]
+    fn test_parse_api_response_api_error() {
+        let data = br#"{"error": {"code": 503, "description": "no suitable peers for placement"}}"#;
+        let result = parse_api_response::<DeleteResponse>(data);
+        match &result {
+            Err(NatsError::Server(msg)) => {
+                assert!(msg.contains("503"));
+                assert!(msg.contains("no suitable peers for placement"));
+            }
+            other => panic!("Expected NatsError::Server, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_api_response_malformed_json() {
+        let result = parse_api_response::<DeleteResponse>(b"not json");
+        assert!(
+            matches!(result, Err(NatsError::Parse(ref msg)) if msg.contains("Failed to parse API response"))
+        );
+    }
+
+    #[test]
+    fn test_parse_api_response_already_exists_matches_guard() {
+        // kv.rs create_bucket ignores errors matching: msg.contains("already exists")
+        let data = br#"{"error": {"code": 400, "description": "stream already exists"}}"#;
+        let result = parse_api_response::<StreamInfo>(data);
+        match result {
+            Err(NatsError::Server(msg)) if msg.contains("already exists") => {}
+            other => {
+                panic!("Expected NatsError::Server matching 'already exists' guard, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_api_response_already_in_use_matches_guard() {
+        // NATS may also return "stream name already in use" (code 10058).
+        // kv.rs create_bucket also matches this variant.
+        let data = br#"{"error": {"code": 400, "description": "stream name already in use"}}"#;
+        let result = parse_api_response::<StreamInfo>(data);
+        match result {
+            Err(NatsError::Server(msg)) if msg.contains("already in use") => {}
+            other => {
+                panic!("Expected NatsError::Server matching 'already in use' guard, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_api_response_error_format() {
+        let data = br#"{"error": {"code": 404, "description": "stream not found"}}"#;
+        let result = parse_api_response::<StreamInfo>(data);
+        match result {
+            Err(NatsError::Server(msg)) => {
+                assert_eq!(msg, "404: stream not found");
+            }
+            other => panic!("Expected NatsError::Server, got: {other:?}"),
+        }
+    }
 }
 
 impl Default for StreamConfig {

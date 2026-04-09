@@ -20,7 +20,7 @@ pub use client::{NatsClient, SubscriptionHandle};
 pub use error::{NatsError, Result};
 pub use headers::Headers;
 pub use jetstream::JetStreamClient;
-pub use types::{ClientOptions, Message, ServerInfo, Subscription};
+pub use types::{ClientOptions, Message, ServerInfo};
 
 #[cfg(test)]
 mod tests {

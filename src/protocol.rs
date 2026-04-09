@@ -4,35 +4,23 @@ pub const CR_LF: &[u8] = b"\r\n";
 pub const PING: &[u8] = b"PING\r\n";
 pub const PONG: &[u8] = b"PONG\r\n";
 
-pub const OP_MSG: &str = "MSG";
-pub const OP_OK: &str = "+OK";
-pub const OP_ERR: &str = "-ERR";
-pub const OP_PING: &str = "PING";
-pub const OP_PONG: &str = "PONG";
-pub const OP_INFO: &str = "INFO";
-
 fn validate_name(value: &str, kind: &str) -> Result<()> {
     if value.is_empty() {
         return Err(NatsError::InvalidSubject(format!("{kind} cannot be empty")));
     }
-    if value.contains(' ') {
+    if let Some(b) = value
+        .bytes()
+        .find(|b| matches!(b, b' ' | b'\r' | b'\n' | b'\t' | b'\0'))
+    {
+        let name = match b {
+            b' ' => "spaces",
+            b'\r' | b'\n' => "CR/LF",
+            b'\t' => "tabs",
+            b'\0' => "null bytes",
+            _ => unreachable!(),
+        };
         return Err(NatsError::InvalidSubject(format!(
-            "{kind} cannot contain spaces"
-        )));
-    }
-    if value.contains('\r') || value.contains('\n') {
-        return Err(NatsError::InvalidSubject(format!(
-            "{kind} cannot contain CR or LF"
-        )));
-    }
-    if value.contains('\t') {
-        return Err(NatsError::InvalidSubject(format!(
-            "{kind} cannot contain tabs"
-        )));
-    }
-    if value.contains('\0') {
-        return Err(NatsError::InvalidSubject(format!(
-            "{kind} cannot contain null bytes"
+            "{kind} cannot contain {name}"
         )));
     }
     Ok(())
@@ -96,7 +84,9 @@ pub fn build_pub_cmd(subject: &str, reply: Option<&str>, data: &[u8]) -> Result<
         validate_subject(reply)?;
     }
 
-    let mut cmd = Vec::new();
+    // "PUB " + subject + " " + reply? + " " + size_digits + "\r\n" + data + "\r\n"
+    let cap = 4 + subject.len() + reply.map_or(0, |r| r.len() + 1) + 10 + 4 + data.len();
+    let mut cmd = Vec::with_capacity(cap);
     cmd.extend_from_slice(b"PUB ");
     cmd.extend_from_slice(subject.as_bytes());
 
@@ -125,7 +115,9 @@ pub fn build_hpub_cmd(
         validate_subject(reply)?;
     }
 
-    let mut cmd = Vec::new();
+    let cap =
+        5 + subject.len() + reply.map_or(0, |r| r.len() + 1) + 20 + 4 + headers.len() + data.len();
+    let mut cmd = Vec::with_capacity(cap);
     cmd.extend_from_slice(b"HPUB ");
     cmd.extend_from_slice(subject.as_bytes());
 
@@ -532,12 +524,6 @@ mod tests {
         assert_eq!(PING, b"PING\r\n");
         assert_eq!(PONG, b"PONG\r\n");
         assert_eq!(CR_LF, b"\r\n");
-        assert_eq!(OP_MSG, "MSG");
-        assert_eq!(OP_OK, "+OK");
-        assert_eq!(OP_ERR, "-ERR");
-        assert_eq!(OP_PING, "PING");
-        assert_eq!(OP_PONG, "PONG");
-        assert_eq!(OP_INFO, "INFO");
     }
 
     #[test]

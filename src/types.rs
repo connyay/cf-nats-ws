@@ -63,13 +63,6 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Subscription {
-    pub id: u64,
-    pub subject: String,
-    pub queue: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectInfo {
     pub verbose: bool,
@@ -116,6 +109,24 @@ impl Default for ConnectInfo {
             jwt: None,
             nkey: None,
             sig: None,
+        }
+    }
+}
+
+impl From<ClientOptions> for ConnectInfo {
+    fn from(opts: ClientOptions) -> Self {
+        Self {
+            name: opts.name,
+            verbose: opts.verbose,
+            pedantic: opts.pedantic,
+            echo: opts.echo,
+            headers: opts.headers,
+            auth_token: opts.auth_token,
+            user: opts.user,
+            pass: opts.pass,
+            jwt: opts.jwt,
+            nkey: opts.nkey,
+            ..Default::default()
         }
     }
 }
@@ -249,27 +260,58 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription() {
-        let sub = Subscription {
-            id: 1,
-            subject: "test.>".to_string(),
-            queue: Some("workers".to_string()),
+    fn test_connect_info_from_client_options() {
+        let opts = ClientOptions {
+            name: Some("test-client".to_string()),
+            verbose: true,
+            pedantic: true,
+            echo: false,
+            headers: false,
+            auth_token: Some("token".to_string()),
+            user: Some("admin".to_string()),
+            pass: Some("secret".to_string()),
+            jwt: Some("jwt-value".to_string()),
+            nkey: Some("nkey-value".to_string()),
         };
-        assert_eq!(sub.id, 1);
-        assert_eq!(sub.subject, "test.>");
-        assert_eq!(sub.queue, Some("workers".to_string()));
+
+        let info = ConnectInfo::from(opts);
+
+        // Fields transferred from ClientOptions
+        assert_eq!(info.name, Some("test-client".to_string()));
+        assert!(info.verbose);
+        assert!(info.pedantic);
+        assert!(!info.echo);
+        assert!(!info.headers);
+        assert_eq!(info.auth_token, Some("token".to_string()));
+        assert_eq!(info.user, Some("admin".to_string()));
+        assert_eq!(info.pass, Some("secret".to_string()));
+        assert_eq!(info.jwt, Some("jwt-value".to_string()));
+        assert_eq!(info.nkey, Some("nkey-value".to_string()));
+
+        // Fields filled from Default
+        assert_eq!(info.lang, "rust");
+        assert!(info.no_responders);
+        assert!(!info.tls_required);
+        assert_eq!(info.protocol, 1);
+        assert!(info.sig.is_none());
     }
 
     #[test]
-    fn test_subscription_without_queue() {
-        let sub = Subscription {
-            id: 42,
-            subject: "events.*".to_string(),
-            queue: None,
-        };
-        assert_eq!(sub.id, 42);
-        assert_eq!(sub.subject, "events.*");
-        assert!(sub.queue.is_none());
+    fn test_connect_info_from_default_client_options() {
+        let opts = ClientOptions::default();
+        let info = ConnectInfo::from(opts);
+
+        // Default ClientOptions values should carry through
+        assert!(info.name.is_none());
+        assert!(!info.verbose);
+        assert!(!info.pedantic);
+        assert!(info.echo);
+        assert!(info.headers);
+        assert!(info.auth_token.is_none());
+        assert!(info.user.is_none());
+        assert!(info.pass.is_none());
+        assert!(info.jwt.is_none());
+        assert!(info.nkey.is_none());
     }
 
     #[test]

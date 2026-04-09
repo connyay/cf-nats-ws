@@ -56,17 +56,12 @@ impl KvStore {
 
         let response = self.client.request(&subject, &data).await?;
 
-        // Check for errors in response
-        let api_response: ApiResponse<StreamInfo> = serde_json::from_slice(&response.data)
-            .map_err(|e| NatsError::Parse(format!("Failed to parse create response: {e}")))?;
-
-        if let Some(error) = api_response.error
-            && !error.description.contains("already exists")
-        {
-            return Err(NatsError::Server(format!(
-                "{}: {}",
-                error.code, error.description
-            )));
+        // Ignore "already exists" errors
+        match super::parse_api_response::<StreamInfo>(&response.data) {
+            Ok(_) => {}
+            Err(NatsError::Server(msg))
+                if msg.contains("already exists") || msg.contains("already in use") => {}
+            Err(e) => return Err(e),
         }
 
         console_log!("KV: Bucket {} created/exists", self.bucket);
@@ -198,23 +193,13 @@ impl KvStore {
         // Check if stream has any messages
         let info_subject = format!("{}.STREAM.INFO.{}", self.js.prefix, self.stream);
         let response = self.client.request(&info_subject, b"").await?;
-        let info: ApiResponse<StreamInfo> = serde_json::from_slice(&response.data)
-            .map_err(|e| NatsError::Parse(format!("Failed to parse stream info: {e}")))?;
-        if let Some(error) = info.error {
-            return Err(NatsError::Server(format!(
-                "{}: {}",
-                error.code, error.description
-            )));
-        }
-        let stream_info = info
-            .response
-            .ok_or_else(|| NatsError::Parse("No stream info".to_string()))?;
+        let stream_info: StreamInfo = super::parse_api_response(&response.data)?;
         if stream_info.state.messages == 0 {
             return Ok(Vec::new());
         }
 
         // Create an ephemeral ordered consumer with last_per_subject delivery
-        let inbox = format!("_INBOX.{}", super::generate_inbox());
+        let inbox = format!("_INBOX.{}", crate::client::generate_inbox_id());
         let filter_subject = format!("{}.{}.>", KV_PREFIX, self.bucket);
 
         let consumer_config = serde_json::json!({
@@ -394,4 +379,4 @@ impl Default for KvBucketConfig {
 }
 
 // Re-use types from parent module
-use super::{ApiResponse, DiscardPolicy, RetentionPolicy, StorageType, StreamConfig, StreamInfo};
+use super::{DiscardPolicy, RetentionPolicy, StorageType, StreamConfig, StreamInfo};

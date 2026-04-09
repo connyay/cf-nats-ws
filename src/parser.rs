@@ -3,9 +3,12 @@ use crate::protocol;
 use crate::types::Message;
 use bytes::{Buf, BufMut, BytesMut};
 
-// Type alias to reduce complexity
-// (subject, reply, sid, total_size, optional_hdr_size)
-type MsgArgTuple = (String, Option<String>, u64, usize, Option<usize>);
+struct MsgArgs {
+    subject: String,
+    reply: Option<String>,
+    sid: u64,
+    hdr_size: Option<usize>,
+}
 
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -61,7 +64,7 @@ pub struct Parser {
     state: State,
     buffer: BytesMut,
     arg_buffer: Vec<u8>,
-    msg_arg: Option<MsgArgTuple>,
+    msg_arg: Option<MsgArgs>,
     msg_needed: usize,
 }
 
@@ -492,9 +495,14 @@ impl Parser {
                             NatsError::Parse(format!("Invalid UTF-8 in MSG arg: {e}"))
                         })?;
 
-                        let parsed = protocol::parse_msg_arg(arg_str)?;
-                        self.msg_needed = parsed.3;
-                        self.msg_arg = Some((parsed.0, parsed.1, parsed.2, parsed.3, None));
+                        let (subject, reply, sid, size) = protocol::parse_msg_arg(arg_str)?;
+                        self.msg_needed = size;
+                        self.msg_arg = Some(MsgArgs {
+                            subject,
+                            reply,
+                            sid,
+                            hdr_size: None,
+                        });
                         self.arg_buffer.clear();
                         self.state = State::MsgData;
                     } else {
@@ -511,10 +519,15 @@ impl Parser {
                             NatsError::Parse(format!("Invalid UTF-8 in HMSG arg: {e}"))
                         })?;
 
-                        let parsed = protocol::parse_hmsg_arg(arg_str)?;
-                        self.msg_needed = parsed.4;
-                        self.msg_arg =
-                            Some((parsed.0, parsed.1, parsed.2, parsed.4, Some(parsed.3)));
+                        let (subject, reply, sid, hdr_size, total_size) =
+                            protocol::parse_hmsg_arg(arg_str)?;
+                        self.msg_needed = total_size;
+                        self.msg_arg = Some(MsgArgs {
+                            subject,
+                            reply,
+                            sid,
+                            hdr_size: Some(hdr_size),
+                        });
                         self.arg_buffer.clear();
                         self.state = State::MsgData;
                     } else {
@@ -526,8 +539,12 @@ impl Parser {
                         let data = self.buffer.split_to(self.msg_needed);
                         self.buffer.advance(2); // Skip \r\n
 
-                        if let Some((subject, reply, sid, _total_size, hdr_size)) =
-                            self.msg_arg.take()
+                        if let Some(MsgArgs {
+                            subject,
+                            reply,
+                            sid,
+                            hdr_size,
+                        }) = self.msg_arg.take()
                         {
                             if let Some(hdr_size) = hdr_size {
                                 // HMSG with headers
