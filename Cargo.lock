@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "cf-nats-ws"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "console_error_panic_hook",
