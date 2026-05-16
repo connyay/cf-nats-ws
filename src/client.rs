@@ -478,36 +478,21 @@ async fn wasm_timeout<F: std::future::Future + Unpin>(
     future: F,
 ) -> Result<F::Output> {
     use futures::future::{Either, select};
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen::prelude::*;
 
-    let (timeout_tx, timeout_rx) = futures::channel::oneshot::channel::<()>();
-    let timeout_tx = Rc::new(RefCell::new(Some(timeout_tx)));
+    let timeout = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+        let global = js_sys::global();
+        let set_timeout: js_sys::Function = js_sys::Reflect::get(&global, &"setTimeout".into())
+            .unwrap()
+            .into();
+        let _ = set_timeout.call2(
+            &wasm_bindgen::JsValue::NULL,
+            &resolve,
+            &wasm_bindgen::JsValue::from(timeout_ms),
+        );
+    }));
 
-    let closure = Closure::once(move || {
-        if let Some(tx) = timeout_tx.borrow_mut().take() {
-            let _ = tx.send(());
-        }
-    });
-
-    let timeout_id = worker::js_sys::global()
-        .unchecked_into::<web_sys::WorkerGlobalScope>()
-        .set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            timeout_ms,
-        )
-        .map_err(|_| NatsError::InvalidState("Failed to set timeout".to_string()))?;
-    // Closure::once is consumed when the timeout fires, but if the future resolves first,
-    // JS still holds a reference — forget() prevents invalidation in WASM.
-    closure.forget();
-
-    match select(std::pin::pin!(future), timeout_rx).await {
-        Either::Left((result, _)) => {
-            worker::js_sys::global()
-                .unchecked_into::<web_sys::WorkerGlobalScope>()
-                .clear_timeout_with_handle(timeout_id);
-            Ok(result)
-        }
+    match select(std::pin::pin!(future), std::pin::pin!(timeout)).await {
+        Either::Left((result, _)) => Ok(result),
         Either::Right(_) => Err(NatsError::Timeout),
     }
 }

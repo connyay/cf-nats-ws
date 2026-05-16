@@ -3,7 +3,20 @@ use cf_nats_ws::{ClientOptions, Headers, JetStreamClient, NatsClient};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::rc::Rc;
+use wasm_bindgen::JsValue;
 use worker::*;
+
+async fn sleep_ms(ms: u32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let global = js_sys::global();
+        let set_timeout: js_sys::Function =
+            js_sys::Reflect::get(&global, &"setTimeout".into())
+                .unwrap()
+                .into();
+        let _ = set_timeout.call2(&JsValue::NULL, &resolve, &JsValue::from(ms));
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
 
 #[derive(Deserialize)]
 struct PublishRequest {
@@ -195,7 +208,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     break;
                 }
                 // Race between next message and timeout
-                let timeout = gloo_timers::future::TimeoutFuture::new(remaining as u32);
+                let timeout = sleep_ms(remaining as u32);
                 let next = sub.next();
                 futures::pin_mut!(timeout);
                 futures::pin_mut!(next);
@@ -241,7 +254,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             while js_sys::Date::now() < deadline {
                 let remaining = deadline - js_sys::Date::now();
-                let timeout = gloo_timers::future::TimeoutFuture::new(remaining as u32);
+                let timeout = sleep_ms(remaining as u32);
                 let next = sub.next();
                 futures::pin_mut!(timeout);
                 futures::pin_mut!(next);
