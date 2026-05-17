@@ -4,6 +4,8 @@ use futures::channel::mpsc;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 use worker::{WebSocket, WebsocketEvent, console_error};
 
 pub struct WsTransport {
@@ -43,15 +45,20 @@ impl WsTransport {
             debug_log!("WsTransport: Event handler ready, listening for events");
             while let Some(event) = events.next().await {
                 match event {
-                    Ok(WebsocketEvent::Message(msg)) => {
-                        if let Some(bytes) = msg.bytes() {
-                            debug_log!("WsTransport: Received {} bytes", bytes.len());
-                            if tx.unbounded_send(bytes).is_err() {
+                    Ok(WebsocketEvent::Message(msg)) => match message_data(&msg).await {
+                        Ok(Some(data)) => {
+                            debug_log!("WsTransport: Received {} bytes", data.len());
+                            if tx.unbounded_send(data).is_err() {
                                 console_error!("WsTransport: Failed to send message to channel");
                                 break;
                             }
                         }
-                    }
+                        Ok(None) => {}
+                        Err(e) => {
+                            console_error!("WsTransport: Failed to read message: {:?}", e);
+                            break;
+                        }
+                    },
                     Ok(WebsocketEvent::Close(e)) => {
                         console_error!("WsTransport: WebSocket closed: {:?}", e);
                         break;
@@ -100,4 +107,26 @@ impl WsTransport {
             .close::<String>(None, None)
             .map_err(|e| NatsError::WebSocket(format!("Close failed: {e}")))
     }
+}
+
+async fn message_data(msg: &worker::MessageEvent) -> Result<Option<Vec<u8>>> {
+    let value = msg.as_ref().data();
+
+    if value.is_instance_of::<js_sys::ArrayBuffer>() {
+        return Ok(Some(js_sys::Uint8Array::new(&value).to_vec()));
+    }
+
+    if let Some(text) = value.as_string() {
+        return Ok(Some(text.into_bytes()));
+    }
+
+    if value.is_instance_of::<web_sys::Blob>() {
+        let blob: web_sys::Blob = value.unchecked_into();
+        let buffer = JsFuture::from(blob.array_buffer())
+            .await
+            .map_err(|e| NatsError::WebSocket(format!("Failed to read Blob: {e:?}")))?;
+        return Ok(Some(js_sys::Uint8Array::new(&buffer).to_vec()));
+    }
+
+    Ok(None)
 }
