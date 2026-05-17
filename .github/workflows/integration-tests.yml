@@ -39,6 +39,15 @@ jobs:
           toolchain: stable
           target: wasm32-unknown-unknown
 
+      # worker-build --panic-unwind hardcodes `cargo +nightly`, so we install
+      # a pinned nightly that predates rust-lang/rust#156061 (landed 2026-05-09)
+      # which emits Br instructions the wasm-bindgen 0.2.121 interpreter can't handle.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-05-08
+          target: wasm32-unknown-unknown
+          components: rust-src
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
