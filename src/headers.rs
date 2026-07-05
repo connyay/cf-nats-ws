@@ -81,25 +81,40 @@ impl Headers {
         self.status_description.as_deref()
     }
 
-    /// Encode headers to NATS wire format
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encode headers to NATS wire format.
+    ///
+    /// Fails if any key, value, or status description contains characters
+    /// that would corrupt the wire format (CR, LF, NUL, or ':' in a key) —
+    /// otherwise a value like "x\r\nEvil: y" would inject a forged header.
+    pub fn encode(&self) -> Result<Vec<u8>> {
         use std::io::Write;
         let mut result = Vec::with_capacity(128);
 
         result.extend_from_slice(HEADER_VERSION.as_bytes());
         if let (Some(code), Some(desc)) = (self.status_code, &self.status_description) {
+            if contains_forbidden_char(desc) {
+                return Err(NatsError::Protocol(
+                    "header status description cannot contain CR, LF, or NUL".to_string(),
+                ));
+            }
             let _ = write!(result, " {code} {desc}");
         }
         result.extend_from_slice(b"\r\n");
 
         for (key, values) in &self.inner {
+            validate_header_key(key)?;
             for value in values {
+                if contains_forbidden_char(value) {
+                    return Err(NatsError::Protocol(format!(
+                        "value of header {key:?} cannot contain CR, LF, or NUL"
+                    )));
+                }
                 let _ = write!(result, "{key}: {value}\r\n");
             }
         }
 
         result.extend_from_slice(b"\r\n");
-        result
+        Ok(result)
     }
 
     /// Decode headers from NATS wire format
@@ -151,6 +166,27 @@ impl Headers {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
         self.inner.iter()
     }
+}
+
+fn contains_forbidden_char(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0'))
+}
+
+fn validate_header_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(NatsError::Protocol(
+            "header key cannot be empty".to_string(),
+        ));
+    }
+    if key
+        .bytes()
+        .any(|b| matches!(b, b':' | b'\r' | b'\n' | b'\0'))
+    {
+        return Err(NatsError::Protocol(format!(
+            "header key {key:?} cannot contain ':', CR, LF, or NUL"
+        )));
+    }
+    Ok(())
 }
 
 /// Canonicalize header key to Title-Case in a single pass.
@@ -291,7 +327,7 @@ mod tests {
         headers.set("Content-Type", "application/json");
         headers.set("X-Custom", "value");
 
-        let encoded = headers.encode();
+        let encoded = headers.encode().unwrap();
         let decoded = Headers::decode(&encoded).unwrap();
 
         assert_eq!(decoded.get("Content-Type"), Some("application/json"));
@@ -303,7 +339,7 @@ mod tests {
         let mut headers = Headers::new();
         headers.set("Content-Type", "application/json");
 
-        let encoded = headers.encode();
+        let encoded = headers.encode().unwrap();
         let encoded_str = std::str::from_utf8(&encoded).unwrap();
 
         assert!(encoded_str.starts_with("NATS/1.0\r\n"));
@@ -314,7 +350,7 @@ mod tests {
     #[test]
     fn test_headers_with_status() {
         let headers = Headers::with_status(503, "No Responders");
-        let encoded = headers.encode();
+        let encoded = headers.encode().unwrap();
         let decoded = Headers::decode(&encoded).unwrap();
 
         assert_eq!(decoded.status_code(), Some(503));
@@ -324,7 +360,7 @@ mod tests {
     #[test]
     fn test_headers_encode_with_status() {
         let headers = Headers::with_status(404, "Not Found");
-        let encoded = headers.encode();
+        let encoded = headers.encode().unwrap();
         let encoded_str = std::str::from_utf8(&encoded).unwrap();
 
         assert!(encoded_str.starts_with("NATS/1.0 404 Not Found\r\n"));
@@ -406,7 +442,7 @@ mod tests {
         headers.append("Accept", "application/json");
         headers.set("Content-Type", "text/plain");
 
-        let encoded = headers.encode();
+        let encoded = headers.encode().unwrap();
         let decoded = Headers::decode(&encoded).unwrap();
 
         let accept_values = decoded.get_all("Accept");
@@ -414,6 +450,46 @@ mod tests {
             accept_values.contains(&"text/html") || accept_values.contains(&"application/json")
         );
         assert_eq!(decoded.get("Content-Type"), Some("text/plain"));
+    }
+
+    #[test]
+    fn test_headers_encode_rejects_crlf_injection_in_value() {
+        let mut headers = Headers::new();
+        headers.set("X-Ok", "value\r\nX-Injected: evil");
+        assert!(headers.encode().is_err());
+
+        let mut headers = Headers::new();
+        headers.append("X-Ok", "bare\rcr");
+        assert!(headers.encode().is_err());
+
+        let mut headers = Headers::new();
+        headers.set("X-Ok", "bare\nlf");
+        assert!(headers.encode().is_err());
+
+        let mut headers = Headers::new();
+        headers.set("X-Ok", "nul\0byte");
+        assert!(headers.encode().is_err());
+    }
+
+    #[test]
+    fn test_headers_encode_rejects_invalid_key() {
+        let mut headers = Headers::new();
+        headers.set("X-Bad\r\nX-Evil", "value");
+        assert!(headers.encode().is_err());
+
+        let mut headers = Headers::new();
+        headers.set("X-Bad:Colon", "value");
+        assert!(headers.encode().is_err());
+
+        let mut headers = Headers::new();
+        headers.set("", "value");
+        assert!(headers.encode().is_err());
+    }
+
+    #[test]
+    fn test_headers_encode_rejects_crlf_in_status_description() {
+        let headers = Headers::with_status(503, "desc\r\nX-Evil: y");
+        assert!(headers.encode().is_err());
     }
 
     #[test]
@@ -428,7 +504,7 @@ mod tests {
 
         for (code, desc) in test_cases {
             let headers = Headers::with_status(code, desc);
-            let encoded = headers.encode();
+            let encoded = headers.encode().unwrap();
             let decoded = Headers::decode(&encoded).unwrap();
 
             assert_eq!(decoded.status_code(), Some(code));

@@ -292,7 +292,7 @@ impl NatsClient {
     ) -> Result<()> {
         debug_log!("NatsClient: Publishing to {}", subject);
         let cmd = if let Some(headers) = headers {
-            let encoded = headers.encode();
+            let encoded = headers.encode()?;
             self.check_payload_size(encoded.len() + data.len())?;
             protocol::build_hpub_cmd(subject, reply, &encoded, data)?
         } else {
