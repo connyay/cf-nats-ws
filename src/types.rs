@@ -98,7 +98,7 @@ impl Default for ConnectInfo {
             tls_required: false,
             name: None,
             lang: "rust".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             protocol: 1,
             echo: true,
             headers: true,

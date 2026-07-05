@@ -149,11 +149,14 @@ Implements the [NATS client protocol](https://docs.nats.io/reference/reference-p
 
 Automatically converts between URL schemes:
 
-- `nats://host:port` → `ws://host:port`
+- `nats://host:port` → `wss://host:port`
 - `tls://host:port` → `wss://host:port`
 - `nats+tls://host:port` → `wss://host:port`
+- `host:port` (no scheme) → `wss://host:port`
 - `ws://host:port` → used as-is
 - `wss://host:port` → used as-is
+
+Every scheme maps to TLS (`wss://`); plaintext requires an explicit `ws://` URL.
 
 ## Example: Cloudflare Worker
 

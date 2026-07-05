@@ -376,6 +376,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ping_waits_for_crlf() {
+        let mut parser = Parser::new();
+        // Op name complete but no terminator yet: nothing should be emitted
+        assert!(parser.parse(b"PING").unwrap().is_empty());
+        assert!(parser.parse(b"\r").unwrap().is_empty());
+        let ops = parser.parse(b"\n").unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Op::Ping));
+    }
+
+    #[test]
+    fn test_parse_msg_missing_trailing_crlf_is_error() {
+        let mut parser = Parser::new();
+        // Payload claims 5 bytes but is followed by garbage instead of CRLF
+        let result = parser.parse(b"MSG test.subject 1 5\r\nhelloXX");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_hmsg_hdr_size_exceeding_total_is_error_not_panic() {
         let mut parser = Parser::new();
         let result = parser.parse(b"HMSG test.subject 1 100 5\r\nhello\r\n");
@@ -544,6 +563,11 @@ impl Parser {
                 State::MsgData => {
                     if self.buffer.len() >= self.msg_needed + 2 {
                         let data = self.buffer.split_to(self.msg_needed);
+                        if self.buffer[0] != b'\r' || self.buffer[1] != b'\n' {
+                            return Err(NatsError::Parse(
+                                "Expected CRLF after message payload".to_string(),
+                            ));
+                        }
                         self.buffer.advance(2); // Skip \r\n
 
                         if let Some(MsgArgs {
@@ -558,7 +582,14 @@ impl Parser {
                                 use crate::headers::Headers;
                                 let headers = if hdr_size > 0 {
                                     let hdr_data = &data[..hdr_size];
-                                    Some(Headers::decode(hdr_data).unwrap_or_default())
+                                    Some(Headers::decode(hdr_data).unwrap_or_else(|_e| {
+                                        #[cfg(target_arch = "wasm32")]
+                                        ::worker::console_warn!(
+                                            "NatsClient: Failed to decode message headers: {}",
+                                            _e
+                                        );
+                                        Default::default()
+                                    }))
                                 } else {
                                     None
                                 };
@@ -607,21 +638,27 @@ impl Parser {
                 State::OpPi => self.transition(b'N', b'n', State::OpPin)?,
                 State::OpPin => self.transition(b'G', b'g', State::OpPing)?,
                 State::OpPing => {
-                    self.consume_to_crlf()?;
+                    if !self.consume_to_crlf() {
+                        break;
+                    }
                     ops.push(Op::Ping);
                     self.state = State::OpStart;
                 }
                 State::OpPo => self.transition(b'N', b'n', State::OpPon)?,
                 State::OpPon => self.transition(b'G', b'g', State::OpPong)?,
                 State::OpPong => {
-                    self.consume_to_crlf()?;
+                    if !self.consume_to_crlf() {
+                        break;
+                    }
                     ops.push(Op::Pong);
                     self.state = State::OpStart;
                 }
                 State::OpPlus => self.transition(b'O', b'o', State::OpPlusO)?,
                 State::OpPlusO => self.transition(b'K', b'k', State::OpPlusOk)?,
                 State::OpPlusOk => {
-                    self.consume_to_crlf()?;
+                    if !self.consume_to_crlf() {
+                        break;
+                    }
                     ops.push(Op::Ok);
                     self.state = State::OpStart;
                 }
@@ -681,12 +718,14 @@ impl Parser {
             .find(|&i| self.buffer[i] == b'\r' && self.buffer[i + 1] == b'\n')
     }
 
-    fn consume_to_crlf(&mut self) -> Result<()> {
+    /// Consume through the next CRLF. Returns false (consuming nothing) if
+    /// the CRLF hasn't arrived yet, so ops are only emitted once terminated.
+    fn consume_to_crlf(&mut self) -> bool {
         if let Some(pos) = self.find_crlf() {
             self.buffer.advance(pos + 2);
-            Ok(())
+            true
         } else {
-            Ok(())
+            false
         }
     }
 }

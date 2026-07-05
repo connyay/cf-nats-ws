@@ -16,6 +16,12 @@ pub struct NatsClient {
     subscriptions: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     next_sid: Rc<RefCell<u64>>,
     pongs: Rc<RefCell<VecDeque<oneshot::Sender<()>>>>,
+    // Request/reply multiplexing: one wildcard inbox subscription shared by
+    // all requests instead of a SUB/UNSUB round trip per request.
+    inbox_prefix: String,
+    resp_map: Rc<RefCell<HashMap<u64, oneshot::Sender<Message>>>>,
+    next_resp_token: RefCell<u64>,
+    resp_mux_started: RefCell<bool>,
 }
 
 impl NatsClient {
@@ -26,11 +32,12 @@ impl NatsClient {
     pub async fn connect_with_options(url: &str, options: ClientOptions) -> Result<Self> {
         console_log!("NatsClient: Starting connection to {}", redact_url(url));
 
-        // Convert URL to WebSocket URL if needed
+        // Convert URL to WebSocket URL if needed. Everything except an
+        // explicit ws:// maps to TLS — plaintext must be opted into.
         let ws_url = if url.starts_with("ws://") || url.starts_with("wss://") {
             url.to_string()
         } else if url.starts_with("nats://") {
-            url.replace("nats://", "ws://")
+            url.replace("nats://", "wss://")
         } else if url.starts_with("nats+tls://") {
             url.replace("nats+tls://", "wss://")
         } else if url.starts_with("tls://") {
@@ -137,6 +144,10 @@ impl NatsClient {
             subscriptions: subscriptions.clone(),
             next_sid,
             pongs: pongs.clone(),
+            inbox_prefix: format!("_INBOX.{}", generate_inbox_id()),
+            resp_map: Rc::new(RefCell::new(HashMap::new())),
+            next_resp_token: RefCell::new(1),
+            resp_mux_started: RefCell::new(false),
         };
 
         // Start message processing task
@@ -344,7 +355,8 @@ impl NatsClient {
             transport: self.transport.clone(),
             subscriptions: self.subscriptions.clone(),
             max_msgs: None,
-            msg_count: Rc::new(RefCell::new(0)),
+            msg_count: 0,
+            unsubscribed: false,
         })
     }
 
@@ -369,18 +381,38 @@ impl NatsClient {
         timeout_ms: u32,
     ) -> Result<Message> {
         debug_log!("NatsClient: Making request to {}", subject);
-        let inbox = format!("_INBOX.{}", generate_inbox_id());
+        self.ensure_response_mux().await?;
 
-        let mut sub = self.subscribe(&inbox).await?;
-        match headers {
-            Some(headers) => self.publish_with_headers_and_reply(subject, &inbox, headers, data)?,
-            None => self.publish_with_reply(subject, &inbox, data)?,
+        let token = {
+            let mut next = self.next_resp_token.borrow_mut();
+            let token = *next;
+            *next += 1;
+            token
+        };
+        let reply = format!("{}.{}", self.inbox_prefix, token);
+
+        let (tx, rx) = oneshot::channel();
+        self.resp_map.borrow_mut().insert(token, tx);
+
+        let published = match headers {
+            Some(headers) => self.publish_with_headers_and_reply(subject, &reply, headers, data),
+            None => self.publish_with_reply(subject, &reply, data),
+        };
+        if let Err(e) = published {
+            self.resp_map.borrow_mut().remove(&token);
+            return Err(e);
         }
 
         let timeout_ms = timeout_ms.min(i32::MAX as u32) as i32;
-        let msg = wasm_timeout(timeout_ms, Box::pin(sub.next()))
-            .await?
-            .ok_or_else(|| NatsError::Connection("connection closed".to_string()))?;
+        let msg = match wasm_timeout(timeout_ms, rx).await {
+            Ok(Ok(msg)) => msg,
+            // Sender dropped: the mux pump exited because the connection closed
+            Ok(Err(_)) => return Err(NatsError::Connection("connection closed".to_string())),
+            Err(e) => {
+                self.resp_map.borrow_mut().remove(&token);
+                return Err(e);
+            }
+        };
 
         // Check for No Responders (503 status)
         if let Some(headers) = &msg.headers
@@ -390,6 +422,48 @@ impl NatsClient {
         }
 
         Ok(msg)
+    }
+
+    /// Subscribe once to `<inbox_prefix>.*` and spawn a pump that routes
+    /// responses to their per-request oneshot channels.
+    async fn ensure_response_mux(&self) -> Result<()> {
+        if *self.resp_mux_started.borrow() {
+            return Ok(());
+        }
+        // Set before the await below so a concurrent request can't double-subscribe
+        *self.resp_mux_started.borrow_mut() = true;
+
+        let mux_subject = format!("{}.*", self.inbox_prefix);
+        let mut sub = match self.subscribe(&mux_subject).await {
+            Ok(sub) => sub,
+            Err(e) => {
+                *self.resp_mux_started.borrow_mut() = false;
+                return Err(e);
+            }
+        };
+
+        let resp_map = self.resp_map.clone();
+        let token_start = self.inbox_prefix.len() + 1;
+        worker::wasm_bindgen_futures::spawn_local(async move {
+            while let Some(msg) = sub.next().await {
+                let token = msg
+                    .subject
+                    .get(token_start..)
+                    .and_then(|t| t.parse::<u64>().ok());
+                if let Some(tx) = token.and_then(|t| resp_map.borrow_mut().remove(&t)) {
+                    let _ = tx.send(msg);
+                } else {
+                    debug_log!(
+                        "NatsClient: Dropping response with no pending request: {}",
+                        msg.subject
+                    );
+                }
+            }
+            // Connection closed: fail all in-flight requests immediately
+            resp_map.borrow_mut().clear();
+        });
+
+        Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -436,7 +510,8 @@ pub struct SubscriptionHandle {
     transport: Rc<WsTransport>,
     subscriptions: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
     max_msgs: Option<u64>,
-    msg_count: Rc<RefCell<u64>>,
+    msg_count: u64,
+    unsubscribed: bool,
 }
 
 impl SubscriptionHandle {
@@ -445,11 +520,13 @@ impl SubscriptionHandle {
     }
 
     pub fn unsubscribe(&mut self) -> Result<()> {
+        if self.unsubscribed {
+            return Ok(());
+        }
+        self.unsubscribed = true;
+        self.subscriptions.borrow_mut().remove(&self.sid);
         let cmd = protocol::build_unsub_cmd(self.sid, None);
-        self.transport.send(&cmd)?;
-        let mut subs = self.subscriptions.borrow_mut();
-        subs.remove(&self.sid);
-        Ok(())
+        self.transport.send(&cmd)
     }
 
     pub fn unsubscribe_after(&mut self, max_msgs: u64) -> Result<()> {
@@ -479,12 +556,14 @@ impl SubscriptionHandle {
 
 impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
+        if self.unsubscribed {
+            return;
+        }
         // Send UNSUB to server (ignore errors — we may already be disconnected)
         let cmd = protocol::build_unsub_cmd(self.sid, None);
         let _ = self.transport.send(&cmd);
         // Remove from subscriptions map to prevent leaking the entry
-        let mut subs = self.subscriptions.borrow_mut();
-        subs.remove(&self.sid);
+        self.subscriptions.borrow_mut().remove(&self.sid);
     }
 }
 
@@ -492,25 +571,27 @@ impl Stream for SubscriptionHandle {
     type Item = Message;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let poll = self.receiver.poll_next_unpin(cx);
+        let this = self.get_mut();
+        let poll = this.receiver.poll_next_unpin(cx);
 
         if let std::task::Poll::Ready(Some(_)) = &poll {
-            let mut count = self.msg_count.borrow_mut();
-            *count += 1;
+            this.msg_count += 1;
 
-            if let Some(max) = self.max_msgs
-                && *count >= max
+            if let Some(max) = this.max_msgs
+                && this.msg_count >= max
             {
                 debug_log!(
                     "NatsClient: Auto-unsubscribing sid {} after {} messages",
-                    self.sid,
-                    *count
+                    this.sid,
+                    this.msg_count
                 );
-                let mut subs = self.subscriptions.borrow_mut();
-                subs.remove(&self.sid);
+                // The server already removed the subscription at max_msgs, so
+                // no UNSUB is needed on drop.
+                this.unsubscribed = true;
+                this.subscriptions.borrow_mut().remove(&this.sid);
             }
         }
 
