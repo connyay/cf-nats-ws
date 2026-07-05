@@ -223,7 +223,7 @@ pub fn parse_msg_arg(arg: &str) -> Result<(String, Option<String>, u64, usize)> 
 pub fn parse_hmsg_arg(arg: &str) -> Result<(String, Option<String>, u64, usize, usize)> {
     let parts: Vec<&str> = arg.split_whitespace().collect();
 
-    match parts.len() {
+    let (subject, reply, sid, hdr_size, total_size) = match parts.len() {
         4 => {
             // HMSG <subject> <sid> <hdr_size> <total_size>
             let subject = parts[0].to_string();
@@ -236,7 +236,7 @@ pub fn parse_hmsg_arg(arg: &str) -> Result<(String, Option<String>, u64, usize, 
             let total_size = parts[3]
                 .parse::<usize>()
                 .map_err(|_| NatsError::Parse("Invalid total size".to_string()))?;
-            Ok((subject, None, sid, hdr_size, total_size))
+            (subject, None, sid, hdr_size, total_size)
         }
         // HMSG <subject> <sid> <reply-to> <hdr_size> <total_size>
         5 => {
@@ -251,10 +251,18 @@ pub fn parse_hmsg_arg(arg: &str) -> Result<(String, Option<String>, u64, usize, 
             let total_size = parts[4]
                 .parse::<usize>()
                 .map_err(|_| NatsError::Parse("Invalid total size".to_string()))?;
-            Ok((subject, reply, sid, hdr_size, total_size))
+            (subject, reply, sid, hdr_size, total_size)
         }
-        _ => Err(NatsError::Parse("Invalid HMSG arguments".to_string())),
+        _ => return Err(NatsError::Parse("Invalid HMSG arguments".to_string())),
+    };
+
+    if hdr_size > total_size {
+        return Err(NatsError::Parse(format!(
+            "Header size {hdr_size} exceeds total size {total_size}"
+        )));
     }
+
+    Ok((subject, reply, sid, hdr_size, total_size))
 }
 
 #[cfg(test)]
@@ -505,6 +513,14 @@ mod tests {
         // Too many arguments
         let result = parse_hmsg_arg("subject reply 1 10 15 extra");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_hmsg_arg_rejects_hdr_size_exceeding_total() {
+        assert!(parse_hmsg_arg("subject 1 10 5").is_err());
+        assert!(parse_hmsg_arg("subject 1 reply.to 10 5").is_err());
+        // Equal sizes are valid (empty payload)
+        assert!(parse_hmsg_arg("subject 1 10 10").is_ok());
     }
 
     #[test]

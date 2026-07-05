@@ -9,6 +9,9 @@ use std::rc::Rc;
 
 pub use kv::{KvBucketConfig, KvEntry, KvStore, Operation};
 
+/// How long to wait for a JetStream publish acknowledgment.
+const ACK_TIMEOUT_MS: u32 = 5_000;
+
 /// JetStream client wrapper
 pub struct JetStreamClient {
     client: Rc<NatsClient>,
@@ -47,24 +50,15 @@ impl JetStreamClient {
     ) -> Result<PubAck> {
         debug_log!("JetStream: Publishing to {}", subject);
 
-        let inbox = format!("_INBOX.{}", crate::client::generate_inbox_id());
-        let mut sub = self.client.subscribe(&inbox).await?;
-
-        if let Some(headers) = headers {
-            self.client
-                .publish_with_headers_and_reply(subject, &inbox, headers, data)?;
-        } else {
-            self.client.publish_with_reply(subject, &inbox, data)?;
-        }
-
-        match sub.next().await {
-            Some(msg) => {
-                let ack: PubAck = serde_json::from_slice(&msg.data)
-                    .map_err(|e| NatsError::Parse(format!("Failed to parse PubAck: {e}")))?;
-                Ok(ack)
-            }
-            None => Err(NatsError::Timeout),
-        }
+        // request_inner applies the ack timeout and maps a 503 status (no
+        // stream matching the subject) to NatsError::NoResponders.
+        let msg = self
+            .client
+            .request_inner(subject, headers, data, ACK_TIMEOUT_MS)
+            .await?;
+        let ack: PubAck = serde_json::from_slice(&msg.data)
+            .map_err(|e| NatsError::Parse(format!("Failed to parse PubAck: {e}")))?;
+        Ok(ack)
     }
 
     /// Get stream info

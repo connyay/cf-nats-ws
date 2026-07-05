@@ -8,6 +8,11 @@ const KV_OPERATION_HDR: &str = "KV-Operation";
 const KV_PREFIX: &str = "$KV";
 const NATS_ROLLUP_HDR: &str = "Nats-Rollup";
 
+/// The keys() consumer uses a 5s idle_heartbeat, so a healthy consumer
+/// delivers something at least that often; longer silence means the consumer
+/// or connection is dead.
+const KEYS_IDLE_TIMEOUT_MS: i32 = 15_000;
+
 /// JetStream KV Store
 pub struct KvStore {
     client: Rc<NatsClient>,
@@ -252,7 +257,19 @@ impl KvStore {
         let mut seen = std::collections::HashSet::new();
         let mut received = 0u64;
 
-        while let Some(msg) = sub.next().await {
+        loop {
+            let next =
+                crate::client::wasm_timeout(KEYS_IDLE_TIMEOUT_MS, std::pin::pin!(sub.next())).await;
+            let msg = match next {
+                Ok(Some(msg)) => msg,
+                // Connection closed
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = sub.unsubscribe();
+                    return Err(NatsError::Timeout);
+                }
+            };
+
             // Skip flow control / heartbeat messages (status 100)
             if let Some(headers) = &msg.headers
                 && headers.status_code() == Some(100)

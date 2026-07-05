@@ -376,6 +376,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hmsg_hdr_size_exceeding_total_is_error_not_panic() {
+        let mut parser = Parser::new();
+        let result = parser.parse(b"HMSG test.subject 1 100 5\r\nhello\r\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_err_without_message() {
         let mut parser = Parser::new();
         let ops = parser.parse(b"-ERR \r\n").unwrap();

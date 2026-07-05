@@ -24,7 +24,7 @@ impl NatsClient {
     }
 
     pub async fn connect_with_options(url: &str, options: ClientOptions) -> Result<Self> {
-        console_log!("NatsClient: Starting connection to {}", url);
+        console_log!("NatsClient: Starting connection to {}", redact_url(url));
 
         // Convert URL to WebSocket URL if needed
         let ws_url = if url.starts_with("ws://") || url.starts_with("wss://") {
@@ -41,7 +41,7 @@ impl NatsClient {
 
         debug_log!(
             "NatsClient: Connecting to WebSocket URL: {}",
-            ws_url.split('?').next().unwrap_or(&ws_url)
+            redact_url(&ws_url)
         );
         let transport = WsTransport::connect(&ws_url).await?;
         let mut parser = Parser::new();
@@ -54,31 +54,28 @@ impl NatsClient {
             attempts += 1;
             debug_log!("NatsClient: Attempt {} to get INFO message", attempts);
 
-            if let Some(data) = transport.next_message().await? {
-                debug_log!("NatsClient: Received data: {} bytes", data.len());
-                let ops = parser.parse(&data)?;
-                debug_log!("NatsClient: Parsed {} operations", ops.len());
-
-                for op in ops {
-                    match &op {
-                        Op::Info(json) => {
-                            debug_log!("NatsClient: Got INFO: {}", json);
-                            let info: ServerInfo = serde_json::from_str(json)?;
-                            server_info = Some(info);
-                            break;
-                        }
-                        _ => {
-                            console_warn!("NatsClient: Got unexpected op: {:?}", op);
-                        }
+            let Some(data) = transport.next_message().await? else {
+                return Err(NatsError::Connection(
+                    "connection closed before INFO received".to_string(),
+                ));
+            };
+            debug_log!("NatsClient: Received data: {} bytes", data.len());
+            for op in parser.parse(&data)? {
+                match op {
+                    Op::Info(json) => {
+                        debug_log!("NatsClient: Got INFO: {}", json);
+                        server_info = Some(serde_json::from_str::<ServerInfo>(&json)?);
+                    }
+                    Op::Ping => transport.send(protocol::PONG)?,
+                    Op::Err(e) => return Err(NatsError::Server(e)),
+                    op => {
+                        console_warn!("NatsClient: Got unexpected op: {:?}", op);
                     }
                 }
-            } else {
-                // Small delay before retry
-                debug_log!("NatsClient: No message yet, waiting...");
             }
         }
 
-        let server_info = server_info.ok_or_else(|| {
+        let mut server_info = server_info.ok_or_else(|| {
             NatsError::Connection("No INFO message received after 10 attempts".to_string())
         })?;
         debug_log!("NatsClient: Got server info: {:?}", server_info.server_id);
@@ -91,6 +88,42 @@ impl NatsClient {
         // Send initial PING to complete handshake
         debug_log!("NatsClient: Sending initial PING");
         transport.send(protocol::PING)?;
+
+        // Wait for the PONG (or -ERR, e.g. auth failure) so connect() reports
+        // handshake failures instead of returning a client that appears
+        // connected. This also consumes the handshake PONG, so it can't
+        // complete an unrelated flush() early.
+        let handshake = async {
+            loop {
+                let Some(data) = transport.next_message().await? else {
+                    return Err(NatsError::Connection(
+                        "connection closed during handshake".to_string(),
+                    ));
+                };
+                let mut pong = false;
+                for op in parser.parse(&data)? {
+                    match op {
+                        Op::Pong => pong = true,
+                        Op::Err(e) => return Err(NatsError::Server(e)),
+                        Op::Ping => transport.send(protocol::PONG)?,
+                        Op::Info(json) => match serde_json::from_str::<ServerInfo>(&json) {
+                            Ok(info) => server_info = info,
+                            Err(e) => {
+                                console_warn!("NatsClient: Failed to parse INFO update: {}", e);
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+                if pong {
+                    return Ok(());
+                }
+            }
+        };
+        wasm_timeout(5000, std::pin::pin!(handshake))
+            .await
+            .map_err(|_| NatsError::Connection("handshake timed out".to_string()))??;
+        debug_log!("NatsClient: Handshake complete");
 
         let transport = Rc::new(transport);
         let subscriptions = Rc::new(RefCell::new(HashMap::new()));
@@ -113,11 +146,22 @@ impl NatsClient {
         let info_clone = server_info.clone();
         worker::wasm_bindgen_futures::spawn_local(async move {
             debug_log!("NatsClient: Starting message processor");
-            if let Err(e) =
-                Self::process_messages(transport_clone, subs_clone, pongs_clone, info_clone).await
+            if let Err(e) = Self::process_messages(
+                transport_clone,
+                parser,
+                subs_clone.clone(),
+                pongs_clone.clone(),
+                info_clone,
+            )
+            .await
             {
                 console_log!("NatsClient: Message processing error: {:?}", e);
             }
+            // The connection is gone. Drop all subscription senders so pending
+            // sub.next() calls resolve to None, and drop pending flush waiters
+            // so flush() fails immediately instead of waiting out its timeout.
+            subs_clone.borrow_mut().clear();
+            pongs_clone.borrow_mut().clear();
         });
 
         Ok(client)
@@ -125,11 +169,11 @@ impl NatsClient {
 
     async fn process_messages(
         transport: Rc<WsTransport>,
+        mut parser: Parser,
         subscriptions: Rc<RefCell<HashMap<u64, mpsc::UnboundedSender<Message>>>>,
         pongs: Rc<RefCell<VecDeque<oneshot::Sender<()>>>>,
         server_info: Rc<RefCell<ServerInfo>>,
     ) -> Result<()> {
-        let mut parser = Parser::new();
         debug_log!("NatsClient: Message processor started");
 
         loop {
@@ -314,15 +358,29 @@ impl NatsClient {
         data: &[u8],
         timeout_ms: u32,
     ) -> Result<Message> {
+        self.request_inner(subject, None, data, timeout_ms).await
+    }
+
+    pub(crate) async fn request_inner(
+        &self,
+        subject: &str,
+        headers: Option<&crate::headers::Headers>,
+        data: &[u8],
+        timeout_ms: u32,
+    ) -> Result<Message> {
         debug_log!("NatsClient: Making request to {}", subject);
         let inbox = format!("_INBOX.{}", generate_inbox_id());
 
         let mut sub = self.subscribe(&inbox).await?;
-        self.publish_with_reply(subject, &inbox, data)?;
+        match headers {
+            Some(headers) => self.publish_with_headers_and_reply(subject, &inbox, headers, data)?,
+            None => self.publish_with_reply(subject, &inbox, data)?,
+        }
 
-        let msg = wasm_timeout(timeout_ms as i32, Box::pin(sub.next()))
+        let timeout_ms = timeout_ms.min(i32::MAX as u32) as i32;
+        let msg = wasm_timeout(timeout_ms, Box::pin(sub.next()))
             .await?
-            .ok_or(NatsError::Timeout)?;
+            .ok_or_else(|| NatsError::Connection("connection closed".to_string()))?;
 
         // Check for No Responders (503 status)
         if let Some(headers) = &msg.headers
@@ -341,7 +399,12 @@ impl NatsClient {
         {
             self.pongs.borrow_mut().push_back(tx);
         }
-        self.transport.send(protocol::PING)?;
+        if let Err(e) = self.transport.send(protocol::PING) {
+            // Remove the waiter we just queued, or the next flush's PONG
+            // would pop it and desync the FIFO.
+            self.pongs.borrow_mut().pop_back();
+            return Err(e);
+        }
 
         wasm_timeout(5000, rx)
             .await?
@@ -357,6 +420,10 @@ impl NatsClient {
 
     pub fn close(&self) -> Result<()> {
         console_log!("NatsClient: Closing connection");
+        // Wake pending subscribers/flushes immediately rather than waiting
+        // for the close event to reach the message processor.
+        self.subscriptions.borrow_mut().clear();
+        self.pongs.borrow_mut().clear();
         self.transport.close()
     }
 }
@@ -472,8 +539,27 @@ pub(crate) fn generate_inbox_id() -> String {
     out
 }
 
+/// Strip credentials from a URL for logging: drops the query string (tokens
+/// often ride there) and masks any userinfo in the authority.
+fn redact_url(url: &str) -> String {
+    let base = url.split('?').next().unwrap_or(url);
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, Some(path)),
+            None => (rest, None),
+        };
+        if let Some((_credentials, host)) = authority.rsplit_once('@') {
+            return match path {
+                Some(path) => format!("{scheme}://***@{host}/{path}"),
+                None => format!("{scheme}://***@{host}"),
+            };
+        }
+    }
+    base.to_string()
+}
+
 /// Race a future against a WASM setTimeout. Returns Err(Timeout) if the timer fires first.
-async fn wasm_timeout<F: std::future::Future + Unpin>(
+pub(crate) async fn wasm_timeout<F: std::future::Future + Unpin>(
     timeout_ms: i32,
     future: F,
 ) -> Result<F::Output> {
@@ -494,5 +580,35 @@ async fn wasm_timeout<F: std::future::Future + Unpin>(
     match select(std::pin::pin!(future), std::pin::pin!(timeout)).await {
         Either::Left((result, _)) => Ok(result),
         Either::Right(_) => Err(NatsError::Timeout),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url;
+
+    #[test]
+    fn test_redact_url_plain() {
+        assert_eq!(redact_url("wss://host:443"), "wss://host:443");
+        assert_eq!(redact_url("wss://host/path"), "wss://host/path");
+    }
+
+    #[test]
+    fn test_redact_url_strips_query() {
+        assert_eq!(
+            redact_url("wss://host/path?token=secret"),
+            "wss://host/path"
+        );
+        assert_eq!(redact_url("wss://host?token=secret"), "wss://host");
+    }
+
+    #[test]
+    fn test_redact_url_masks_userinfo() {
+        assert_eq!(
+            redact_url("wss://user:pass@host:8443/sub"),
+            "wss://***@host:8443/sub"
+        );
+        assert_eq!(redact_url("nats://user:pass@host"), "nats://***@host");
+        assert_eq!(redact_url("wss://user:p@ss@host?token=x"), "wss://***@host");
     }
 }
