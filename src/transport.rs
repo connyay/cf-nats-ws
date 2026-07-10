@@ -1,7 +1,7 @@
 use crate::error::{NatsError, Result};
 use futures::StreamExt;
 use futures::channel::mpsc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::JsCast;
@@ -11,6 +11,7 @@ use worker::{WebSocket, WebsocketEvent, console_error};
 pub struct WsTransport {
     ws: Arc<WebSocket>,
     receiver: Rc<RefCell<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    closed_locally: Rc<Cell<bool>>,
 }
 
 impl WsTransport {
@@ -30,6 +31,9 @@ impl WsTransport {
 
         // Create a channel for messages
         let (tx, rx) = mpsc::unbounded();
+
+        let closed_locally = Rc::new(Cell::new(false));
+        let closed_locally_events = closed_locally.clone();
 
         // Set up event handler BEFORE accepting connection
         worker::wasm_bindgen_futures::spawn_local(async move {
@@ -60,7 +64,11 @@ impl WsTransport {
                         }
                     },
                     Ok(WebsocketEvent::Close(e)) => {
-                        console_error!("WsTransport: WebSocket closed: {:?}", e);
+                        if closed_locally_events.get() {
+                            debug_log!("WsTransport: WebSocket closed: {:?}", e);
+                        } else {
+                            console_error!("WsTransport: WebSocket closed: {:?}", e);
+                        }
                         break;
                     }
                     Err(e) => {
@@ -80,6 +88,7 @@ impl WsTransport {
         Ok(Self {
             ws,
             receiver: Rc::new(RefCell::new(rx)),
+            closed_locally,
         })
     }
 
@@ -103,6 +112,7 @@ impl WsTransport {
 
     pub fn close(&self) -> Result<()> {
         debug_log!("WsTransport: Closing WebSocket");
+        self.closed_locally.set(true);
         self.ws
             .close::<String>(None, None)
             .map_err(|e| NatsError::WebSocket(format!("Close failed: {e}")))
