@@ -111,11 +111,27 @@ impl WsTransport {
     }
 
     pub fn close(&self) -> Result<()> {
+        if self.closed_locally.replace(true) {
+            return Ok(());
+        }
         debug_log!("WsTransport: Closing WebSocket");
-        self.closed_locally.set(true);
         self.ws
             .close::<String>(None, None)
             .map_err(|e| NatsError::WebSocket(format!("Close failed: {e}")))
+    }
+
+    /// Whether close() has been called locally. A close initiated by the
+    /// server is not reflected here.
+    pub fn is_closed(&self) -> bool {
+        self.closed_locally.get()
+    }
+}
+
+impl Drop for WsTransport {
+    fn drop(&mut self) {
+        // Close the socket so the event-handler task exits instead of
+        // keeping the WebSocket (and the Worker invocation) alive.
+        let _ = self.close();
     }
 }
 

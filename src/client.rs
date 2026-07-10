@@ -493,12 +493,25 @@ impl NatsClient {
     }
 
     pub fn close(&self) -> Result<()> {
+        if self.transport.is_closed() {
+            return Ok(());
+        }
         console_log!("NatsClient: Closing connection");
         // Wake pending subscribers/flushes immediately rather than waiting
         // for the close event to reach the message processor.
         self.subscriptions.borrow_mut().clear();
         self.pongs.borrow_mut().clear();
         self.transport.close()
+    }
+}
+
+impl Drop for NatsClient {
+    fn drop(&mut self) {
+        // The message-processor task holds its own Rc<WsTransport> and is
+        // parked in next_message() until the socket closes, so dropping the
+        // client without closing would leave the socket and task alive
+        // forever. Closing here unwinds both.
+        let _ = self.close();
     }
 }
 
