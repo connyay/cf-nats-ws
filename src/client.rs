@@ -8,7 +8,7 @@ use futures::{Stream, StreamExt};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use worker::{console_error, console_log, console_warn};
+use worker::{WebSocket, console_error, console_log, console_warn};
 
 pub struct NatsClient {
     transport: Rc<WsTransport>,
@@ -51,6 +51,25 @@ impl NatsClient {
             redact_url(&ws_url)
         );
         let transport = WsTransport::connect(&ws_url).await?;
+        Self::from_transport(transport, options).await
+    }
+
+    /// Connect NATS over an already-connected Workers WebSocket.
+    ///
+    /// The caller owns how the WebSocket is acquired. This supports sockets
+    /// returned by Worker bindings without coupling this crate to `Fetcher`,
+    /// `Env`, or any particular Cloudflare networking product.
+    ///
+    /// The socket must not have been accepted yet and its `events()` stream
+    /// must not have been taken — `accept()` is called internally, and fails
+    /// on a socket the caller already accepted.
+    pub async fn from_websocket(ws: WebSocket, options: ClientOptions) -> Result<Self> {
+        console_log!("NatsClient: Starting connection over supplied WebSocket");
+        let transport = WsTransport::from_websocket(ws)?;
+        Self::from_transport(transport, options).await
+    }
+
+    async fn from_transport(transport: WsTransport, options: ClientOptions) -> Result<Self> {
         let mut parser = Parser::new();
 
         debug_log!("NatsClient: Waiting for INFO message");

@@ -125,6 +125,38 @@ async fn connect_nats(env: &Env) -> Result<NatsClient> {
         .map_err(|e| Error::RustError(format!("NATS connect: {e}")))
 }
 
+/// Establish the WebSocket ourselves via `fetch()` with an `Upgrade` header,
+/// then hand the socket to `NatsClient::from_websocket`. This mirrors how a
+/// socket obtained from a binding (e.g. a VPC Service) would be used.
+async fn connect_nats_via_fetch(env: &Env) -> Result<NatsClient> {
+    let nats_url = env.var("NATS_URL")?.to_string();
+    let token = env.var("NATS_TOKEN").ok().map(|v| v.to_string());
+
+    let http_url = if let Some(rest) = nats_url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = nats_url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else {
+        nats_url
+    };
+
+    let mut req = Request::new(&http_url, Method::Get)?;
+    req.headers_mut()?.set("upgrade", "websocket")?;
+    let resp = Fetch::Request(req).send().await?;
+    let status = resp.status_code();
+    let ws = resp.websocket().ok_or_else(|| {
+        Error::RustError(format!("fetch did not return a websocket (status {status})"))
+    })?;
+
+    let options = ClientOptions {
+        auth_token: token,
+        ..Default::default()
+    };
+    NatsClient::from_websocket(ws, options)
+        .await
+        .map_err(|e| Error::RustError(format!("NATS connect over fetched websocket: {e}")))
+}
+
 async fn connect_jetstream(env: &Env) -> Result<JetStreamClient> {
     let client = connect_nats(env).await?;
     Ok(JetStreamClient::new(Rc::new(client)))
@@ -171,6 +203,17 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .publish_with_headers(&body.subject, &headers, body.data.as_bytes())
                 .map_err(nats_err)?;
             Response::ok("published")
+        })
+        // --- fetch()-established WebSocket handed to NatsClient::from_websocket ---
+        .post_async("/fetch-websocket/publish", |mut req, ctx| async move {
+            let body: PublishRequest = req.json().await?;
+            let client = connect_nats_via_fetch(&ctx.env).await?;
+            client
+                .publish(&body.subject, body.data.as_bytes())
+                .map_err(nats_err)?;
+            client.flush().await.map_err(nats_err)?;
+            let server_id = client.server_info().server_id.clone();
+            Response::from_json(&serde_json::json!({ "server_id": server_id }))
         })
         // --- Request/reply ---
         .post_async("/request", |mut req, ctx| async move {
