@@ -25,6 +25,19 @@ impl WsTransport {
             .await
             .map_err(|e| NatsError::WebSocket(format!("Failed to connect: {e}")))?;
 
+        Self::from_websocket(ws)
+    }
+
+    /// Build a NATS transport around an already-connected Workers WebSocket.
+    ///
+    /// This is useful when the connection must be established through a
+    /// binding (for example, a Workers VPC Service) instead of the global
+    /// WebSocket constructor.
+    ///
+    /// The socket must not have been accepted yet and its `events()` stream
+    /// must not have been taken — `accept()` is called internally, and fails
+    /// on a socket the caller already accepted.
+    pub fn from_websocket(ws: WebSocket) -> Result<Self> {
         // Clone for the event handler BEFORE accepting
         let ws_events = ws.clone();
         let ws = Arc::new(ws);
