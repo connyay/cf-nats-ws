@@ -1,4 +1,5 @@
 import { Miniflare } from "miniflare";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -11,15 +12,26 @@ const NATS_TOKEN = process.env.NATS_TOKEN ?? "dev-nats-token";
 const mf_instance = new Miniflare({
   workers: [
     {
-      name: "test-worker",
-      rootPath: buildDir,
-      scriptPath: "./index.js",
-      compatibilityDate: "2024-08-31",
-      modules: true,
-      modulesRules: [{ type: "CompiledWasm", include: ["**/*.wasm"], fallthrough: true }],
-      bindings: {
-        NATS_URL: NATS_WS_URL,
-        NATS_TOKEN,
+      config: {
+        name: "test-worker",
+        compatibilityDate: "2024-08-31",
+        manifest: {
+          mainModule: "index.js",
+          modules: {
+            "index.js": {
+              type: "esm",
+              contents: readFileSync(resolve(buildDir, "index.js"), "utf8"),
+            },
+            "index_bg.wasm": {
+              type: "wasm",
+              contents: new Uint8Array(readFileSync(resolve(buildDir, "index_bg.wasm"))),
+            },
+          },
+        },
+        env: {
+          NATS_URL: { type: "text", value: NATS_WS_URL },
+          NATS_TOKEN: { type: "text", value: NATS_TOKEN },
+        },
       },
     },
   ],

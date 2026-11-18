@@ -1,11 +1,11 @@
 {
   "name": "test-worker",
   "private": true,
-  "main": "build/worker/shim.mjs",
+  "main": "build/index.js",
   "scripts": {
-    "build": "cargo install -q worker-build@^0.8 && worker-build --release --panic-unwind"
+    "build": "cargo install -q worker-build@^0.9 && worker-build --release --panic-unwind"
   },
   "dependencies": {
-    "wrangler": "^4.69.0"
+    "wrangler": "^4.164.0"
   }
 }
