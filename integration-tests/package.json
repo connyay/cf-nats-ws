@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:worker": "cd test-worker && cargo install -q worker-build@^0.8 && worker-build --release --panic-unwind",
+    "build:worker": "cd test-worker && cargo install -q worker-build@^0.9 && worker-build --release --panic-unwind",
     "pretest": "npm run build:worker",
     "test": "NODE_OPTIONS='--experimental-vm-modules' vitest run",
     "test:watch": "NODE_OPTIONS='--experimental-vm-modules' vitest",
@@ -14,9 +14,9 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250109.0",
-    "miniflare": "^4.0.0",
+    "miniflare": "^5.20261117.0-beta",
     "nats": "^2.28.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^5.1.0"
   }
 }
